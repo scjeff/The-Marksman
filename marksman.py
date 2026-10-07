@@ -42,6 +42,7 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -49,7 +50,7 @@ from pathlib import Path
 
 
 TOOL_NAME = "The Marksman"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 # Binaries the hunt calls. nmcli is used when NetworkManager is present.
 REQUIRED_TOOLS = ("iw", "ip", "rfkill", "busctl", "bluetoothctl")
 OPTIONAL_TOOLS = ("nmcli",)
@@ -65,7 +66,15 @@ BLE_TX_DBM = 0.0
 BT_FREQ_MHZ = 2402.0
 RSSI_FLOOR = -95.0
 RSSI_CEIL = -30.0
+# The column tracks the recent range, with at least this much travel, so a
+# walk of a few tens of feet moves the picture instead of sitting at the top.
+BAR_MIN_SPAN = 8.0
+BAR_PAD_DB = 1.0
+TREND_DB = 1.0
 MIN_PYTHON = (3, 9)
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+BT_NEW_RE = re.compile(r"\[NEW\] Device ([0-9A-Fa-f:]{17})(?:\s+(.*))?$")
+BT_CHG_RE = re.compile(r"\[CHG\] Device ([0-9A-Fa-f:]{17}) ([A-Za-z]+): (.*)$")
 
 # Radiotap fields that can sit before DBM_ANTSIGNAL (bit 5).
 # (size, alignment from the start of the radiotap header).
@@ -111,9 +120,11 @@ DISCLAIMER = """\
   responsible for local law. The authors assume no liability for misuse.
 
   Wi-Fi sight: monitor mode, receive only. No injection, deauthentication,
-  or association. Building the SSID list uses a normal scan (probe requests).
-  Bluetooth: BlueZ discovery, the standard inquiry and LE scan. That scan
-  transmits scan requests. It does not pair, connect, or read GATT.
+  or association. The list uses a normal scan (probe requests), then a short
+  receive-only listen for phones, appliances, and ad-hoc radios.
+  Bluetooth: BlueZ discovery on the built-in adapter, the standard inquiry
+  and LE scan. That scan transmits scan requests. It does not pair, connect,
+  or read GATT. An Ubertooth is not required.
 """
 
 TRACK_FIELDS = [
@@ -331,11 +342,33 @@ def channel_for_mhz(freq: float | None) -> int | None:
     return None
 
 
-def proximity_fraction(rssi: float | None) -> float | None:
+def signal_window(values: list[float]) -> tuple[float, float]:
+    """Floor and ceiling that spread recent samples across the column."""
+    usable = [value for value in values if value is not None]
+    if not usable:
+        return RSSI_FLOOR, RSSI_CEIL
+    lo = min(usable)
+    hi = max(usable)
+    if hi - lo < BAR_MIN_SPAN:
+        mid = (lo + hi) / 2.0
+        lo = mid - BAR_MIN_SPAN / 2.0
+        hi = mid + BAR_MIN_SPAN / 2.0
+    return lo - BAR_PAD_DB, hi + BAR_PAD_DB
+
+
+def proximity_fraction(
+    rssi: float | None,
+    floor: float | None = None,
+    ceil: float | None = None,
+) -> float | None:
     if rssi is None:
         return None
-    span = RSSI_CEIL - RSSI_FLOOR
-    return max(0.0, min(1.0, (rssi - RSSI_FLOOR) / span))
+    if floor is None or ceil is None:
+        floor, ceil = signal_window([rssi])
+    span = ceil - floor
+    if span <= 0:
+        return 0.5
+    return max(0.0, min(1.0, (rssi - floor) / span))
 
 
 def zone_for(distance_m: float | None, rssi: float | None) -> str:
@@ -581,7 +614,7 @@ class SightState:
         self.last_ema = 0.0
         self.last_spark = 0.0
         self.frames = 0
-        self.spark: deque[float] = deque(maxlen=40)
+        self.spark: deque[float] = deque(maxlen=240)
         self.timed: deque[tuple[float, float]] = deque(maxlen=400)
         self.detail = "starting"
         self.note = ""
@@ -630,9 +663,9 @@ class SightState:
             else:
                 break
         delta = self.smooth - past
-        if delta >= 2.0:
+        if delta >= TREND_DB:
             return "CLOSING", delta
-        if delta <= -2.0:
+        if delta <= -TREND_DB:
             return "FALLING BACK", delta
         return "HOLDING", delta
 
@@ -710,38 +743,74 @@ def fit_pieces(pieces: list[tuple[str, str | None]], width: int, color: bool) ->
     return "".join(out)
 
 
-def sparkline(values: list[float], width: int) -> str:
-    if width <= 0:
-        return ""
-    if not values:
-        return "·" * width
-    window = values[-width:]
-    glyphs = "▁▂▃▄▅▆▇█"
-    chars: list[str] = []
-    for value in window:
-        frac = proximity_fraction(value) or 0.0
-        chars.append(glyphs[min(len(glyphs) - 1, int(round(frac * (len(glyphs) - 1))))])
-    return ("·" * (width - len(chars))) + "".join(chars)
-
-
-def bar_lines(fraction: float | None, rows: int, color: bool) -> list[list[tuple[str, str | None]]]:
+def bar_lines(
+    fraction: float | None,
+    rows: int,
+    color: bool,
+    width: int = 4,
+) -> list[list[tuple[str, str | None]]]:
     frac = 0.0 if fraction is None else max(0.0, min(1.0, fraction))
     filled = int(round(frac * rows))
+    on = "█" * max(1, width)
+    off = "░" * max(1, width)
     lines: list[list[tuple[str, str | None]]] = []
     for i in range(rows):
         from_bottom = rows - 1 - i
         if filled > 0 and from_bottom < filled:
             height = from_bottom / max(1, rows - 1)
             paint = heat_paint(height) if color else None
-            lines.append([("████", paint)])
+            lines.append([(on, paint)])
         else:
-            lines.append([("░░░░", MUTED if color else None)])
+            lines.append([(off, MUTED if color else None)])
+    return lines
+
+
+def level_plot(
+    values: list[float],
+    rows: int,
+    cols: int,
+    floor: float,
+    ceil: float,
+    color: bool,
+) -> list[list[tuple[str, str | None]]]:
+    """History across the columns. The right edge is the newest sample."""
+    if cols <= 0 or rows <= 0:
+        return [[] for _ in range(rows)]
+    window = list(values)[-cols:]
+    padded: list[float | None] = [None] * (cols - len(window)) + window
+    lines: list[list[tuple[str, str | None]]] = []
+    for i in range(rows):
+        from_bottom = rows - 1 - i
+        pieces: list[tuple[str, str | None]] = []
+        for value in padded:
+            if value is None:
+                pieces.append(("·", MUTED if color else None))
+                continue
+            frac = proximity_fraction(value, floor, ceil) or 0.0
+            filled = int(round(frac * rows))
+            if filled > 0 and from_bottom < filled:
+                paint = heat_paint(from_bottom / max(1, rows - 1)) if color else None
+                pieces.append(("█", paint))
+            elif from_bottom == 0:
+                pieces.append(("▁", MUTED if color else None))
+            else:
+                pieces.append((" ", None))
+        lines.append(_merge_pieces(pieces))
     return lines
 
 
 def render_sight(view: View, width: int = 78, height: int = 24, color: bool = False) -> str:
-    inner = max(48, min(width - 2, 76))
-    bar_n = max(6, min(12, height - 13))
+    inner = max(48, width - 2)
+    # Rules, title, target block, and footer. The rest of the terminal is the graph.
+    chrome = 13
+    bar_n = max(6, height - chrome)
+    bar_w = 8 if inner < 92 else (12 if inner < 130 else 16)
+    label_w = 10
+    plot_w = inner - 1 - bar_w - 1 - label_w
+    if plot_w < 16:
+        label_w = 0
+        plot_w = max(8, inner - 1 - bar_w - 1)
+        bar_w = max(4, inner - 1 - 1 - plot_w)
     paint = zone_paint(view.zone)
     arrow = {"CLOSING": "▲", "FALLING BACK": "▼", "HOLDING": "◆", "LOST": "×", "SEARCHING": "◌"}.get(
         view.trend, "◆"
@@ -755,10 +824,17 @@ def render_sight(view: View, width: int = 78, height: int = 24, color: bool = Fa
     age = "no fix yet" if view.age_s is None else f"heard {view.age_s:.1f}s ago"
     freq = f"{view.frequency_mhz:.0f} MHz" if view.frequency_mhz else "freq —"
     tx_word = "assumed" if view.tx_assumed else "advertised"
+    samples = list(view.history)
+    if view.smooth_dbm is not None:
+        samples.append(view.smooth_dbm)
+    floor, ceil = signal_window(samples)
+    span_note = f"graph {floor:.0f}..{ceil:.0f} dBm recent"
     note = (
         f"n={PATH_LOSS_EXPONENT:.1f}  tx {view.tx_dbm:.0f} dBm {tx_word}  {freq}"
-        "  ·  near / mid / far, not a tape measure"
+        f"  ·  {span_note}"
     )
+    if view.note:
+        note = f"{view.note}  ·  {note}"
 
     def row(pieces: list[tuple[str, str | None]]) -> str:
         body = fit_pieces(pieces, inner, color)
@@ -775,21 +851,21 @@ def render_sight(view: View, width: int = 78, height: int = 24, color: bool = Fa
     title_left = " ◆ THE MARKSMAN"
     title_right = "DER FREISCHÜTZ ◆ "
     gap = max(1, inner - len(title_left) - len(title_right))
-    sub_left = "  " + clip(view.scan_name or "untitled scan", 28)
+    sub_left = "  " + clip(view.scan_name or "untitled scan", max(12, inner // 3))
     sub_right = clip(view.operator or "", 24) + " "
     sub_gap = max(1, inner - len(sub_left) - len(sub_right))
     mac = view.mac or "MAC not seen yet"
-    target_left = "  TARGET  " + clip(view.target or "—", 28)
+    target_left = "  TARGET  " + clip(view.target or "—", max(12, inner // 2))
     target_right = view.kind
     t_gap = max(1, inner - len(target_left) - len(target_right))
     mac_left = "  " + clip(mac, 22) + "   " + clip(view.iface, 16)
-    mac_right = clip(view.detail, 24)
+    mac_right = clip(view.detail, max(8, inner // 4))
     m_gap = max(1, inner - len(mac_left) - len(mac_right))
     num_left = f"  {signal:<10}   {distance:>8}"
     num_right = f"{arrow} {view.trend}"
     n_gap = max(1, inner - len(num_left) - len(num_right))
     meta_left = f"  smooth {smooth:<10}  {delta}"
-    meta_right = age
+    meta_right = f"{zone_word(view.zone)}  {age}"
     meta_gap = max(1, inner - len(meta_left) - len(meta_right))
 
     header = [
@@ -798,33 +874,33 @@ def render_sight(view: View, width: int = 78, height: int = 24, color: bool = Fa
         row([(target_left, paint), (" " * t_gap, None), (target_right, CYAN)]),
         row([(mac_left, CREAM), (" " * m_gap, None), (mac_right, DIMC)]),
         row([(num_left, paint), (" " * n_gap, None), (num_right, paint)]),
-        row([(meta_left, DIMC), (" " * meta_gap, None), (meta_right, DIMC)]),
+        row([(meta_left, DIMC), (" " * meta_gap, None), (meta_right, paint)]),
     ]
-    spark_w = max(8, inner - 16)
-    history = sparkline(view.history, spark_w)
-    bars = bar_lines(proximity_fraction(view.smooth_dbm), bar_n, color)
+    fraction = proximity_fraction(view.smooth_dbm, floor, ceil)
+    bars = bar_lines(fraction, bar_n, color, width=bar_w)
+    plot = level_plot(samples, bar_n, plot_w, floor, ceil, color)
     graph: list[str] = []
     for i, glyph in enumerate(bars):
-        extra: list[tuple[str, str | None]] = [("  ", None)]
-        if i == 0:
-            extra.append(("near", CYAN))
-        elif i == 1:
-            extra.append(("up means closer", DIMC))
-        elif i == 3:
-            extra.append((history, paint if not color else None))
-            if color:
-                extra = [("  ", None)] + _spark_pieces(view.history, spark_w)
-        elif i == 4:
-            extra.append(("older" + " " * max(0, spark_w - 10) + "now", DIMC))
-        elif i == bar_n - 4:
-            extra.append((zone_word(view.zone), paint))
-        elif i == bar_n - 2:
-            extra.append((clip(view.note, inner - 8), GOLD))
-        elif i == bar_n - 1:
-            extra.append(("far", INDIGO))
-        graph.append(row([("  ", None)] + glyph + extra))
+        gutter = ""
+        gutter_paint: str | None = DIMC
+        if label_w:
+            if i == 0:
+                gutter = "near  now"
+                gutter_paint = CYAN
+            elif i == 1:
+                gutter = "older →"
+                gutter_paint = DIMC
+            elif i == bar_n - 1:
+                gutter = "far"
+                gutter_paint = INDIGO
+            gutter = clip(gutter, label_w).ljust(label_w)
+        extra: list[tuple[str, str | None]] = [(" ", None)]
+        if label_w:
+            extra.append((gutter, gutter_paint))
+        extra.extend(plot[i])
+        graph.append(row([(" ", None)] + glyph + extra))
     footer = [
-        row([("  0 rescan    b back to the list    q quit", GOLD)]),
+        row([("  0 rescan    b back to the list    q quit    up is closer", GOLD)]),
         row([("  " + clip(note, inner - 2), DIMC)]),
     ]
     lines = [
@@ -838,22 +914,10 @@ def render_sight(view: View, width: int = 78, height: int = 24, color: bool = Fa
         *footer,
         rule("╚", "╝"),
     ]
-    # Trim or pad so the sight occupies the terminal and does not scroll.
+    # Trim so a short terminal does not scroll. A tall one is filled by bar_n.
     if len(lines) > height:
         lines = lines[: height - 1] + [lines[-1]]
     return "\n".join(lines)
-
-
-def _spark_pieces(values: list[float], width: int) -> list[tuple[str, str | None]]:
-    text = sparkline(values, width)
-    pieces: list[tuple[str, str | None]] = []
-    glyphs = "▁▂▃▄▅▆▇█"
-    for char in text:
-        if char in glyphs:
-            pieces.append((char, heat_paint(glyphs.index(char) / (len(glyphs) - 1))))
-        else:
-            pieces.append((char, MUTED))
-    return _merge_pieces(pieces)
 
 
 def _merge_pieces(pieces: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
@@ -1062,6 +1126,82 @@ def top_named(hits: list[Hit], limit: int = 5) -> list[Hit]:
     return named[:limit]
 
 
+def top_hits(hits: list[Hit], limit: int = 5) -> list[Hit]:
+    """Strongest devices heard this listen, named or not."""
+    fresh = [hit for hit in hits if hit.rssi is not None and (hit.mac or hit.name)]
+    fresh.sort(key=lambda row: row.rssi if row.rssi is not None else -999, reverse=True)
+    return fresh[:limit]
+
+
+def top_marks(hits: list[Hit], limit: int = 5) -> list[Hit]:
+    """Five strongest Wi-Fi transmitters. Named networks keep one row, the loudest."""
+    named: dict[str, Hit] = {}
+    others: list[Hit] = []
+    for hit in hits:
+        if hit.phy_hint in {"wifi-ap", "wifi-ibss"} and hit.name:
+            cur = named.get(hit.name)
+            if cur is None or (hit.rssi or -999) > (cur.rssi or -999):
+                named[hit.name] = hit
+        elif hit.mac or hit.name:
+            others.append(hit)
+    return top_hits(list(named.values()) + others, limit)
+
+
+def merge_hits(primary: list[Hit], extra: list[Hit]) -> list[Hit]:
+    table: dict[str, Hit] = {}
+    for hit in primary:
+        if hit.mac:
+            table[hit.mac] = hit
+    for hit in extra:
+        if not hit.mac:
+            continue
+        old = table.get(hit.mac)
+        if old is None:
+            table[hit.mac] = hit
+            continue
+        if hit.rssi is not None and (old.rssi is None or hit.rssi > old.rssi):
+            old.rssi = hit.rssi
+        if not old.name and hit.name:
+            old.name = hit.name
+        if old.channel is None and hit.channel:
+            old.channel = hit.channel
+        if old.freq_mhz is None and hit.freq_mhz:
+            old.freq_mhz = hit.freq_mhz
+        if old.phy_hint == "wifi-client" and hit.phy_hint != "wifi-client":
+            old.phy_hint = hit.phy_hint
+    return list(table.values())
+
+
+ROLE_HINT = {"ap": "wifi-ap", "ibss": "wifi-ibss", "client": "wifi-client"}
+
+
+def hit_from_frame(frame: dict) -> Hit | None:
+    mac = str(frame.get("transmitter") or "")
+    if not mac:
+        return None
+    role = str(frame.get("role") or "client")
+    name = ""
+    if role in {"ap", "ibss"} and frame.get("ssid"):
+        name = str(frame["ssid"])
+    freq = frame.get("freq")
+    try:
+        freq_f = float(freq) if freq else None
+    except (TypeError, ValueError):
+        freq_f = None
+    try:
+        rssi = float(frame["rssi"]) if frame.get("rssi") is not None else None
+    except (TypeError, ValueError):
+        rssi = None
+    return Hit(
+        mac=mac,
+        name=name,
+        rssi=rssi,
+        freq_mhz=freq_f,
+        channel=channel_for_mhz(freq_f),
+        phy_hint=ROLE_HINT.get(role, "wifi-client"),
+    )
+
+
 def parse_radiotap(packet: bytes) -> tuple[int, float, float | None] | None:
     """Return (dot11 offset, dBm, freq MHz). Alignment is from byte 0 of the header."""
     if len(packet) < 8:
@@ -1126,18 +1266,45 @@ def read_ssid(tagged: bytes) -> str | None:
 
 
 def parse_dot11(frame: bytes) -> dict | None:
+    """Management and data frames. RSSI belongs to addr2, the radio that sent it."""
     if len(frame) < 24:
         return None
     fc = struct.unpack_from("<H", frame, 0)[0]
     ftype = (fc >> 2) & 0x3
     subtype = (fc >> 4) & 0xF
+    if ftype == 1 or frame[10] & 0x01:
+        return None
     transmitter = mac_str(frame[10:16])
+    to_ds = bool(fc & 0x0100)
+    from_ds = bool(fc & 0x0200)
     ssid = None
-    beacon = False
-    if ftype == 0 and subtype in {5, 8} and len(frame) >= 36:
-        beacon = True
-        ssid = read_ssid(frame[36:])
-    return {"transmitter": transmitter, "ssid": ssid, "beacon": beacon}
+    role = "client"
+    advertises = False
+    if ftype == 0 and subtype in {5, 8}:
+        advertises = True
+        role = "ap"
+        if len(frame) >= 36:
+            cap = struct.unpack_from("<H", frame, 34)[0]
+            if cap & 0x0002 and not (cap & 0x0001):
+                role = "ibss"
+            ssid = read_ssid(frame[36:])
+    elif ftype == 0 and subtype == 4:
+        ssid = read_ssid(frame[24:])
+        role = "client"
+    elif ftype == 2:
+        if from_ds and not to_ds:
+            role = "ap"
+        elif not from_ds and not to_ds:
+            role = "ibss"
+        else:
+            role = "client"
+    return {
+        "transmitter": transmitter,
+        "ssid": ssid,
+        "beacon": advertises,
+        "advertises": advertises,
+        "role": role,
+    }
 
 
 def parse_wifi_packet(packet: bytes) -> dict | None:
@@ -1155,7 +1322,8 @@ def parse_wifi_packet(packet: bytes) -> dict | None:
 
 def frame_matches(frame: dict, target: Target) -> bool:
     if target.mode == "ssid":
-        return bool(frame.get("beacon") and frame.get("ssid") == target.value and target.value)
+        # Beacons and probe responses only. A client probing for the name is not the AP.
+        return bool(frame.get("advertises") and frame.get("ssid") == target.value and target.value)
     if target.mode == "mac":
         return frame.get("transmitter") == target.mac
     return False
@@ -1514,6 +1682,7 @@ class WifiPort:
             raise RadioError("iw and ip are required for monitor mode.")
         nm_set_managed(self.iface, False)
         self.touched = True
+        run_cmd([iw, "dev", self.iface, "set", "power_save", "off"], timeout=4)
         down = run_cmd([ip, "link", "set", self.iface, "down"], timeout=5)
         if down.returncode != 0:
             raise RadioError((down.stderr or "could not set the interface down").strip())
@@ -1536,6 +1705,9 @@ class WifiPort:
             raise RadioError(f"Could not read packets: {exc}") from exc
         self.sock = sock
         self.monitor = True
+        # otherbss asks the driver for frames from networks we are not joined to.
+        # Built-in Intel cards often hide client data without it.
+        run_cmd([iw, "dev", self.iface, "set", "monitor", "otherbss"], timeout=4)
         if channel:
             self.tune(channel)
 
@@ -1616,10 +1788,15 @@ class WifiSource:
         self.note = self.port.note
         if best is None:
             return None
-        beacon = bool(best.get("beacon"))
-        hint = "wifi-ap" if beacon or self.target.phy_hint == "wifi-ap" else "wifi-client"
+        role = str(best.get("role") or "")
         if self.target.mode == "ssid":
+            hint = "wifi-ibss" if role == "ibss" else "wifi-ap"
+        elif role == "ap":
             hint = "wifi-ap"
+        elif role == "ibss":
+            hint = "wifi-ibss"
+        else:
+            hint = "wifi-client"
         tx, assumed = resolve_tx(hint, self.target.advertised_tx)
         freq = best.get("freq") or self.port.freq or self.target.freq_mhz
         channel = channel_for_mhz(freq) or self.port.channel
@@ -1663,9 +1840,11 @@ class WifiSource:
         for hit in hits:
             frame = {
                 "beacon": True,
+                "advertises": True,
                 "ssid": hit.name,
                 "transmitter": hit.mac,
                 "rssi": hit.rssi if hit.rssi is not None else -999,
+                "role": "ap",
             }
             if hit.rssi is None or not frame_matches(frame, self.target):
                 continue
@@ -1705,6 +1884,64 @@ def wifi_scan(iface: str) -> list[Hit]:
             msg += " — run: sudo python3 marksman.py"
         raise RadioError(msg)
     return parse_iw_scan(proc.stdout or "")
+
+
+def listen_stations(port: WifiPort, seconds: float, skip_mac: str = "") -> list[Hit]:
+    """Hop in monitor mode and collect radios that transmit, including clients."""
+    port.open_monitor(HOP_24[0])
+    channels = hop_channels(port.bands)
+    band24 = [channel for channel in channels if channel <= 14]
+    band5 = [channel for channel in channels if channel > 14]
+    deadline = time.monotonic() + max(0.5, seconds)
+    # Appliances and ad-hoc gear are usually on 2.4 GHz. Spend most of the window there.
+    split = time.monotonic() + max(0.5, seconds) * 0.7
+    table: dict[str, Hit] = {}
+    hop_i = 0
+    last = 0.0
+    skip = (skip_mac or "").upper()
+    try:
+        while True:
+            now = time.monotonic()
+            remaining = deadline - now
+            plan = band24 if (now < split or not band5) else band5
+            if not plan:
+                plan = channels or list(HOP_24)
+            if now - last >= 0.28:
+                port.tune(plan[hop_i % len(plan)])
+                hop_i += 1
+                last = now
+            for frame in port.drain(160):
+                hit = hit_from_frame(frame)
+                if hit is None or not hit.mac or hit.mac == skip:
+                    continue
+                prev = table.get(hit.mac)
+                if prev is None:
+                    table[hit.mac] = hit
+                else:
+                    if hit.rssi is not None and (prev.rssi is None or hit.rssi > prev.rssi):
+                        prev.rssi = hit.rssi
+                        if hit.freq_mhz:
+                            prev.freq_mhz = hit.freq_mhz
+                            prev.channel = hit.channel or prev.channel
+                    if hit.name and not prev.name:
+                        prev.name = hit.name
+                    if hit.phy_hint == "wifi-ap":
+                        prev.phy_hint = "wifi-ap"
+                    elif hit.phy_hint == "wifi-ibss" and prev.phy_hint == "wifi-client":
+                        prev.phy_hint = "wifi-ibss"
+            fresh = len(table)
+            print(
+                f"\r  listening… {fresh} transmitters, {max(0.0, remaining):.0f}s left   ",
+                end="",
+                flush=True,
+            )
+            if remaining <= 0:
+                break
+            time.sleep(0.02)
+    finally:
+        print()
+        port.close()
+    return list(table.values())
 
 
 def _busctl_json(args: list[str], timeout: float = 5) -> tuple[int, object, str]:
@@ -1787,14 +2024,98 @@ def _hit_from_device(dev: dict, path: str = "") -> Hit:
     )
 
 
+def parse_bt_event(line: str, live: dict) -> None:
+    """Fold one bluetoothctl line into a MAC → {name, rssi, tx, address_type} table."""
+    clean = ANSI_RE.sub("", line).strip()
+    created = BT_NEW_RE.search(clean)
+    if created:
+        mac = normalize_mac(created.group(1))
+        if not mac:
+            return
+        row = live.setdefault(mac, {})
+        name = usable_name(created.group(2) or "", mac)
+        if name:
+            row["name"] = name
+        return
+    changed = BT_CHG_RE.search(clean)
+    if not changed:
+        return
+    mac = normalize_mac(changed.group(1))
+    if not mac:
+        return
+    key = changed.group(2)
+    val = changed.group(3).strip()
+    row = live.setdefault(mac, {})
+    if key == "RSSI":
+        found = re.search(r"-?\d+(?:\.\d+)?", val)
+        if not found:
+            return
+        rssi = float(found.group(0))
+        if -120.0 < rssi < 0.0:
+            row["rssi"] = rssi
+    elif key in {"Name", "Alias"}:
+        name = usable_name(val, mac)
+        if name:
+            row["name"] = name
+    elif key == "TxPower":
+        found = re.search(r"-?\d+(?:\.\d+)?", val)
+        if found:
+            row["tx"] = float(found.group(0))
+    elif key == "AddressType":
+        row["address_type"] = val
+
+
+def merge_bt(dbus_hits: list[Hit], live: dict) -> list[Hit]:
+    """Prefer this session's RSSI. A cached device with no new advertisement stays quiet."""
+    table: dict[str, Hit] = {}
+    for hit in dbus_hits:
+        if not hit.mac:
+            continue
+        seen = live.get(hit.mac)
+        if seen is None:
+            hit.rssi = None
+        elif seen.get("rssi") is not None:
+            hit.rssi = seen["rssi"]
+        if seen and seen.get("name") and not hit.name:
+            hit.name = seen["name"]
+        if seen and seen.get("tx") is not None and hit.advertised_tx is None:
+            hit.advertised_tx = seen["tx"]
+        table[hit.mac] = hit
+    for mac, row in live.items():
+        if not mac or mac in table:
+            continue
+        addr = str(row.get("address_type") or "")
+        table[mac] = Hit(
+            mac=mac,
+            name=str(row.get("name") or ""),
+            rssi=row.get("rssi"),
+            freq_mhz=BT_FREQ_MHZ,
+            phy_hint="ble" if addr else "bt-classic",
+            advertised_tx=row.get("tx"),
+            address_type=addr,
+        )
+    return list(table.values())
+
+
 class Bluez:
-    def __init__(self, iface: str) -> None:
+    """Hold one bluetoothctl process so BlueZ keeps discovery running.
+
+    A one-shot busctl StartDiscovery ends when that process exits, which is
+    before any advertisement arrives. The built-in adapter then looks empty.
+    """
+
+    def __init__(self, iface: str, mac: str = "") -> None:
         self.iface = iface
+        self.mac = (mac or "").upper()
         self.path = f"/org/bluez/{iface}"
         self.busctl = which("busctl") or "busctl"
-        self.was_discovering = False
         self.started = False
         self.note = ""
+        self.proc: subprocess.Popen[str] | None = None
+        self._lines: deque[str] = deque(maxlen=400)
+        self._live: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._reader: threading.Thread | None = None
 
     def _adapter_prop(self, prop: str):
         code, payload, _err = _busctl_json(
@@ -1804,53 +2125,141 @@ class Bluez:
             return None
         return payload.get("data")
 
+    def _ingest(self, line: str) -> None:
+        clean = ANSI_RE.sub("", line).strip()
+        if not clean:
+            return
+        with self._lock:
+            self._lines.append(clean)
+            if clean.startswith("Failed") or clean.startswith("No default"):
+                self.note = clean[:160]
+            parse_bt_event(clean, self._live)
+            if "Discovery started" in clean:
+                self.note = ""
+
+    def _read_loop(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            return
+        for line in proc.stdout:
+            self._ingest(line)
+
+    def _wait(self, pred, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if any(pred(line) for line in self._lines):
+                    return True
+            time.sleep(0.05)
+        return False
+
+    def send(self, cmd: str) -> None:
+        proc = self.proc
+        if proc is None or proc.stdin is None or proc.poll() is not None:
+            return
+        try:
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+        except OSError:
+            self.note = "bluetoothctl closed"
+
+    def _spawn(self) -> None:
+        bt = which("bluetoothctl")
+        if not bt:
+            raise RadioError("bluetoothctl is not installed. Run: sudo python3 marksman.py --setup")
+        env = dict(os.environ)
+        env["TERM"] = "dumb"
+        self.proc = subprocess.Popen(
+            [bt],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self._reader = threading.Thread(target=self._read_loop, name="marksman-bt", daemon=True)
+        self._reader.start()
+        self._wait(lambda line: "Controller" in line or "bluetooth" in line.lower(), 3.0)
+
+    def _arm(self, transport: str) -> None:
+        # duplicate-data on keeps RSSI moving. The filter is applied by the
+        # following scan command, while this process still owns the session.
+        self.send("menu scan")
+        self.send("duplicate-data on")
+        if transport == "le":
+            self.send("transport le")
+        elif transport == "bredr":
+            self.send("transport bredr")
+        else:
+            self.send("clear transport")
+        self.send("back")
+
     def open(self) -> None:
         if not which("busctl"):
             raise RadioError("busctl is not installed (it comes with systemd / BlueZ).")
-        powered = self._adapter_prop("Powered")
-        if powered is not True:
-            proc = run_cmd(
-                [self.busctl, "set-property", "org.bluez", self.path, "org.bluez.Adapter1", "Powered", "b", "true"]
+        try:
+            powered = self._adapter_prop("Powered")
+            if powered is not True:
+                proc = run_cmd(
+                    [self.busctl, "set-property", "org.bluez", self.path, "org.bluez.Adapter1", "Powered", "b", "true"]
+                )
+                if proc.returncode != 0:
+                    raise RadioError((proc.stderr or "could not power on the Bluetooth controller").strip())
+            self._spawn()
+            if self.mac:
+                self.send(f"select {self.mac}")
+                time.sleep(0.2)
+            self.send("power on")
+            self.send("discoverable off")
+            self.send("pairable off")
+            self._arm("auto")
+            self.send("scan on")
+            started = self._wait(
+                lambda line: "Discovery started" in line or "Discovering: yes" in line,
+                4.0,
             )
-            if proc.returncode != 0:
-                raise RadioError((proc.stderr or "could not power on the Bluetooth controller").strip())
-        self.was_discovering = self._adapter_prop("Discovering") is True
-        if self.was_discovering:
-            run_cmd([self.busctl, "call", "org.bluez", self.path, "org.bluez.Adapter1", "StopDiscovery"], timeout=4)
-        filt = run_cmd(
-            [
-                self.busctl,
-                "call",
-                "org.bluez",
-                self.path,
-                "org.bluez.Adapter1",
-                "SetDiscoveryFilter",
-                "a{sv}",
-                "2",
-                "Transport",
-                "s",
-                "auto",
-                "DuplicateData",
-                "b",
-                "false",
-            ]
-        )
-        if filt.returncode != 0:
-            self.note = (filt.stderr or "discovery filter was not accepted").strip().splitlines()[-1][:120]
-        start = run_cmd([self.busctl, "call", "org.bluez", self.path, "org.bluez.Adapter1", "StartDiscovery"])
-        if start.returncode != 0:
-            err = (start.stderr or start.stdout or "StartDiscovery failed").strip()
-            if "InProgress" not in err and "Already" not in err:
-                raise RadioError(err.splitlines()[-1][:200])
-        self.started = True
+            if not started:
+                self.send("power on")
+                self.send("scan on")
+                started = self._wait(
+                    lambda line: "Discovery started" in line or "Discovering: yes" in line,
+                    3.0,
+                )
+            if not started:
+                self.note = self.note or (
+                    "Discovery did not start. Check bluetoothd, and that this radio is not blocked."
+                )
+            self.started = True
+        except Exception:
+            self.close()
+            raise
+
+    def retune(self, transport: str) -> None:
+        self.send("scan off")
+        time.sleep(0.4)
+        self._arm(transport)
+        self.send("scan on")
+        self._wait(lambda line: "Discovery started" in line or "Discovering: yes" in line, 3.0)
 
     def close(self) -> None:
-        if not self.started:
-            return
-        # Leave the controller as we found it when something else was already discovering.
-        if not self.was_discovering:
-            run_cmd([self.busctl, "call", "org.bluez", self.path, "org.bluez.Adapter1", "StopDiscovery"], timeout=4)
+        proc = self.proc
+        self.proc = None
         self.started = False
+        if proc is None:
+            return
+        if proc.poll() is None and proc.stdin is not None:
+            try:
+                proc.stdin.write("scan off\n")
+                proc.stdin.flush()
+            except OSError:
+                pass
+            time.sleep(0.15)
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     def devices(self) -> list[Hit]:
         code, payload, err = _busctl_json(
@@ -1864,13 +2273,21 @@ class Bluez:
                 "GetManagedObjects",
             ]
         )
+        dbus_hits: list[Hit] = []
         if code != 0:
-            self.note = err.splitlines()[-1][:120] if err else "no device list"
-            return []
-        self.note = ""
-        return parse_managed_objects(payload, self.iface)
+            if not self.note:
+                self.note = err.splitlines()[-1][:120] if err else "no device list"
+        else:
+            dbus_hits = parse_managed_objects(payload, self.iface)
+        with self._lock:
+            live = {mac: dict(row) for mac, row in self._live.items()}
+        return merge_bt(dbus_hits, live)
 
     def rssi(self, mac: str) -> float | None:
+        with self._lock:
+            row = self._live.get(mac)
+            if row and row.get("rssi") is not None:
+                return float(row["rssi"])
         path = f"{self.path}/dev_{mac.replace(':', '_')}"
         code, payload, _err = _busctl_json(
             [self.busctl, "--json=short", "get-property", "org.bluez", path, "org.bluez.Device1", "RSSI"],
@@ -1952,22 +2369,40 @@ class BtSource:
 def format_hit(hit: Hit) -> str:
     rssi = f"{hit.rssi:.0f} dBm" if hit.rssi is not None else "   — dBm"
     dist = format_distance_human(hit.distance())
-    name = clip(hit.name or "(hidden)", 22)
+    name = clip(hit.name or hit.mac or "(hidden)", 22)
     channel = f"ch {hit.channel}" if hit.channel else ""
-    return f"{name:<22} {rssi:>8}  {dist:>8}  {hit.mac}  {channel}".rstrip()
+    role = {
+        "wifi-ap": "AP",
+        "wifi-client": "device",
+        "wifi-ibss": "ad-hoc",
+        "ble": "LE",
+        "bt-classic": "BR",
+    }.get(hit.phy_hint, "")
+    return f"{name:<22} {rssi:>8}  {dist:>8}  {role:<6} {hit.mac}  {channel}".rstrip()
 
 
-def print_target_page(kind: str, rows: list[Hit], heard: int) -> None:
-    title = "Wi-Fi SSIDs" if kind == "wifi" else "Bluetooth names"
+def lock_mode(hit: Hit, kind: str) -> str:
+    if kind == "bluetooth":
+        return "name" if usable_name(hit.name, hit.mac) else "mac"
+    if hit.phy_hint == "wifi-client" or not hit.name:
+        return "mac"
+    return "ssid"
+
+
+def print_target_page(kind: str, rows: list[Hit], heard: int, note: str = "") -> None:
+    title = "Wi-Fi targets" if kind == "wifi" else "Bluetooth devices"
     manual = "enter an SSID" if kind == "wifi" else "enter a device name"
     print()
     print(Colors.wrap(PINK, "┌" + "─" * 72 + "┐"))
     print(Colors.wrap(PINK, "│ ") + Colors.wrap(BOLD + CREAM, clip(f"THE MARKSMAN   {title}", 70).ljust(70)) + Colors.wrap(PINK, " │"))
     print(Colors.wrap(PINK, "└" + "─" * 72 + "┘"))
     if kind == "wifi":
-        print(f"  Heard {heard} named SSIDs. The list is the five strongest.")
+        print(f"  Heard {heard} transmitters. The list is the five strongest.")
+        print("  AP is an access point. device is a phone, Roku, oven, or other client. ad-hoc is IBSS.")
     else:
-        print(f"  Heard {heard} named devices. The list is the five strongest.")
+        print(f"  Heard {heard} devices this listen. The list is the five strongest, names or not.")
+    if note:
+        print(Colors.wrap(GOLD, "  " + note))
     print(Colors.wrap(GOLD, "  0) rescan"))
     for idx in range(1, 6):
         if idx <= len(rows):
@@ -1979,9 +2414,9 @@ def print_target_page(kind: str, rows: list[Hit], heard: int) -> None:
     print(Colors.wrap(DIMC, "  q) quit"))
 
 
-def prompt_menu(kind: str, rows: list[Hit], heard: int) -> tuple[str, int | None]:
+def prompt_menu(kind: str, rows: list[Hit], heard: int, note: str = "") -> tuple[str, int | None]:
     while True:
-        print_target_page(kind, rows, heard)
+        print_target_page(kind, rows, heard, note)
         if not sys.stdin.isatty():
             return "quit", None
         raw = input("Select [0 rescan, 1-5, 6 manual, 7 MAC, q quit]: ").strip()
@@ -2156,25 +2591,41 @@ def write_reports(outdir: Path, session: dict, stats_book: dict[str, HuntStats])
     (outdir / "marksman_report.md").write_text("\n".join(md), encoding="utf-8")
 
 
-def collect_bt(bluez: Bluez, window: float) -> list[Hit]:
-    table: dict[str, Hit] = {}
+def _listen_bt(bluez: Bluez, window: float, seed: list[Hit] | None = None) -> list[Hit]:
+    table: dict[str, Hit] = {hit.mac: hit for hit in (seed or []) if hit.mac}
     deadline = time.monotonic() + window
     while True:
         for hit in bluez.devices():
             if hit.mac:
                 table[hit.mac] = hit
         remaining = deadline - time.monotonic()
-        named = len(top_named(list(table.values()), limit=1000))
+        fresh = len([hit for hit in table.values() if hit.rssi is not None])
         print(
-            f"\r  discovering… {len(table)} devices, {named} named, {max(0, remaining):.0f}s left   ",
+            f"\r  discovering… {fresh} devices with a signal, {max(0.0, remaining):.0f}s left   ",
             end="",
             flush=True,
         )
         if remaining <= 0:
             break
-        time.sleep(min(0.8, remaining))
+        time.sleep(min(0.4, remaining))
     print()
     return list(table.values())
+
+
+def collect_bt(bluez: Bluez, window: float) -> list[Hit]:
+    hits = _listen_bt(bluez, window)
+    fresh = [hit for hit in hits if hit.rssi is not None]
+    if not fresh:
+        log("No Bluetooth advertisements yet. Trying a low-energy scan…", "warn")
+        bluez.retune("le")
+        hits = _listen_bt(bluez, window, hits)
+        fresh = [hit for hit in hits if hit.rssi is not None]
+    if not fresh:
+        bluez.note = bluez.note or (
+            "No devices answered. They have to be awake and advertising. "
+            "This uses the built-in adapter. An Ubertooth is not required."
+        )
+    return hits
 
 
 def open_session(path: Path, session: dict) -> None:
@@ -2445,7 +2896,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mac", default="", help="MAC address to lock")
     parser.add_argument("--bt-name", default="", help="Bluetooth device name to lock")
     parser.add_argument("--duration", type=float, default=0, help="stop the sight after N seconds")
-    parser.add_argument("--scan-window", type=float, default=8, help="seconds to listen before the Bluetooth list")
+    parser.add_argument(
+        "--scan-window",
+        type=float,
+        default=8,
+        help="seconds to listen for Wi-Fi devices and Bluetooth devices before the list",
+    )
     parser.add_argument("--dry-run", action="store_true", help="record the plan and do not touch the radio")
     parser.add_argument(
         "--setup",
@@ -2524,6 +2980,7 @@ def wifi_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Namespace,
     port = WifiPort(ctrl["iface"], list(ctrl.get("bands") or []))
     hits: list[Hit] = []
     need_scan = preset is None
+    window = min(60.0, max(1.0, float(args.scan_window)))
     try:
         while True:
             target = preset
@@ -2531,21 +2988,40 @@ def wifi_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Namespace,
                 if need_scan:
                     log(f"Scanning Wi-Fi on {ctrl['iface']}…", "info")
                     try:
-                        hits = wifi_scan(ctrl["iface"])
+                        scanned = wifi_scan(ctrl["iface"])
                     except RadioError as exc:
                         log(str(exc), "err")
-                        hits = []
+                        scanned = []
+                    log(f"Listening {window:.0f}s for devices that are not access points…", "info")
+                    heard: list[Hit] = []
+                    try:
+                        heard = listen_stations(port, window, skip_mac=(ctrl.get("mac") or "").upper())
+                    except RadioError as exc:
+                        log(
+                            f"Could not listen in monitor mode ({exc}). The list is access points from the scan.",
+                            "warn",
+                        )
+                    hits = merge_hits(scanned, heard)
+                    clients = [hit for hit in hits if hit.phy_hint in {"wifi-client", "wifi-ibss"}]
+                    access = [hit for hit in hits if hit.phy_hint == "wifi-ap"]
+                    log(f"Heard {len(access)} access points and {len(clients)} other transmitters.", "ok")
+                    if not clients and ctrl.get("driver") == "iwlwifi":
+                        log(
+                            "No phone, appliance, or ad-hoc radio in this listen. Some built-in Intel cards "
+                            "only pass beacons, so a Roku or an oven stays invisible. A USB adapter can hear "
+                            "them, or enter the device MAC with 7.",
+                            "warn",
+                        )
                     need_scan = False
-                rows = top_ssids(hits)
-                named = len({hit.name for hit in hits if hit.name})
-                action, slot = prompt_menu("wifi", rows, named)
+                rows = top_marks(hits)
+                action, slot = prompt_menu("wifi", rows, len(hits))
                 if action in {"quit", "back"}:
                     break
                 if action == "rescan":
                     need_scan = True
                     continue
                 if action == "slot" and slot is not None:
-                    target = target_from_hit(rows[slot], "ssid")
+                    target = target_from_hit(rows[slot], lock_mode(rows[slot], "wifi"))
                 elif action == "manual-name":
                     target = ask_ssid(hits)
                 elif action == "manual-mac":
@@ -2587,7 +3063,7 @@ def wifi_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Namespace,
 def bluetooth_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Namespace, preset: Target | None) -> dict[str, HuntStats]:
     book: dict[str, HuntStats] = {}
     track = TrackLog(outdir / "marksman_track.csv")
-    bluez = Bluez(ctrl["iface"])
+    bluez = Bluez(ctrl["iface"], ctrl.get("mac") or "")
     window = min(60.0, max(1.0, float(args.scan_window)))
     hits: list[Hit] = []
     need_scan = preset is None
@@ -2604,16 +3080,17 @@ def bluetooth_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Names
                     fresh = bluez.devices()
                     if fresh:
                         hits = fresh
-                rows = top_named(hits)
-                named = len([hit for hit in hits if usable_name(hit.name, hit.mac)])
-                action, slot = prompt_menu("bluetooth", rows, named)
+                rows = top_hits(hits)
+                heard = len([hit for hit in hits if hit.rssi is not None])
+                note = "" if rows else (bluez.note or "Nothing advertising right now. Press 0 to listen again.")
+                action, slot = prompt_menu("bluetooth", rows, heard, note)
                 if action in {"quit", "back"}:
                     break
                 if action == "rescan":
                     need_scan = True
                     continue
                 if action == "slot" and slot is not None:
-                    target = target_from_hit(rows[slot], "name")
+                    target = target_from_hit(rows[slot], lock_mode(rows[slot], "bluetooth"))
                 elif action == "manual-name":
                     target = ask_bt_name(hits)
                 elif action == "manual-mac":
@@ -2825,8 +3302,45 @@ BSS aa:bb:cc:dd:ee:05(on wlx0)
     check(frame is not None and frame["transmitter"] == "AA:BB:CC:DD:EE:FF", "beacon transmitter")
     check(frame is not None and frame["rssi"] == -48 and frame["beacon"], "beacon rssi")
     target = Target(mode="ssid", value="TestNet", phy_hint="wifi-ap")
+    check(frame is not None and frame.get("role") == "ap", "beacon is an AP")
     check(frame is not None and frame_matches(frame, target), "ssid match")
     check(frame is not None and frame_matches(frame, Target(mode="mac", value="AA:BB:CC:DD:EE:FF", mac="AA:BB:CC:DD:EE:FF")), "mac match")
+
+    client = bytes.fromhex("102233445566")
+    ap = bytes.fromhex("aabbccddeeff")
+    data = struct.pack("<HH", 0x0108, 0) + ap + client + ap + struct.pack("<H", 0)
+    data_frame = parse_wifi_packet(rt([0x22], bytes([0x00, 256 - 60])) + data)
+    client_mac = "10:22:33:44:55:66"
+    check(data_frame is not None and data_frame["role"] == "client", "client data role")
+    check(data_frame is not None and data_frame["transmitter"] == client_mac.upper(), "client transmitter")
+    check(
+        data_frame is not None and frame_matches(data_frame, Target(mode="mac", value=client_mac.upper(), mac=client_mac.upper())),
+        "client mac match",
+    )
+    check(data_frame is not None and not frame_matches(data_frame, Target(mode="ssid", value="Home")), "client data is not an SSID")
+
+    probe_ssid = b"Home"
+    probe = struct.pack("<HH", 0x0040, 0) + (b"\xff" * 6) + client + (b"\xff" * 6) + struct.pack("<H", 0)
+    probe += bytes([0, len(probe_ssid)]) + probe_ssid
+    probe_frame = parse_wifi_packet(rt([0x22], bytes([0x00, 256 - 61])) + probe)
+    check(probe_frame is not None and probe_frame["role"] == "client" and probe_frame["ssid"] == "Home", "probe request")
+    check(probe_frame is not None and not frame_matches(probe_frame, Target(mode="ssid", value="Home")), "probe request is not the AP")
+
+    ibss_ssid = b"Adhoc"
+    ibss = struct.pack("<H", 0x0080) + b"\x00\x00" + (b"\xff" * 6) + bssid + bssid + b"\x00\x00"
+    ibss += b"\x00" * 8 + struct.pack("<HH", 100, 0x0002)
+    ibss += bytes([0, len(ibss_ssid)]) + ibss_ssid
+    ibss_frame = parse_wifi_packet(rt([0x22], bytes([0x00, 256 - 50])) + ibss)
+    check(ibss_frame is not None and ibss_frame["role"] == "ibss" and ibss_frame["ssid"] == "Adhoc", "ibss beacon")
+    check(ibss_frame is not None and frame_matches(ibss_frame, Target(mode="ssid", value="Adhoc")), "ibss ssid match")
+
+    client_hit = Hit(mac=client_mac.upper(), name="", rssi=-48, freq_mhz=2437, channel=6, phy_hint="wifi-client")
+    marks = top_marks(hits + [client_hit])
+    check(any(hit.phy_hint == "wifi-client" for hit in marks), "client joins the five")
+    check(any(hit.mac == "AA:BB:CC:DD:EE:04" for hit in marks), "hidden BSSID stays selectable")
+    check(marks[0].name == "Zoo", "strongest mark still leads")
+    check(lock_mode(client_hit, "wifi") == "mac", "client locks by MAC")
+    check(lock_mode(marks[0], "wifi") == "ssid", "named AP locks by SSID")
 
     payload = {
         "type": "a{oa{sa{sv}}}",
@@ -2855,7 +3369,22 @@ BSS aa:bb:cc:dd:ee:05(on wlx0)
     check(len(devices) == 2, "bluez device count")
     named = top_named(devices)
     check(len(named) == 1 and named[0].name == "Kitchen", "unnamed alias dropped")
+    ranked = top_hits(devices)
+    check(len(ranked) == 2 and ranked[0].rssi == -40, "unnamed device still ranks")
+    check(lock_mode(ranked[0], "bluetooth") == "mac", "unnamed bluetooth locks by MAC")
+    check(lock_mode(ranked[1], "bluetooth") == "name", "named bluetooth locks by name")
     check(named[0].phy_hint == "ble" and named[0].rssi == -58, "ble hint and rssi")
+    live: dict = {}
+    parse_bt_event("[NEW] Device AA:BB:CC:DD:EE:20 Range", live)
+    parse_bt_event("[CHG] Device AA:BB:CC:DD:EE:20 RSSI: -47", live)
+    check(live["AA:BB:CC:DD:EE:20"]["name"] == "Range" and live["AA:BB:CC:DD:EE:20"]["rssi"] == -47, "bluetoothctl lines")
+    merged = merge_bt([], live)
+    check(len(merged) == 1 and merged[0].rssi == -47 and merged[0].name == "Range", "live bluetooth hit")
+    stale = merge_bt(
+        [Hit(mac="AA:BB:CC:DD:EE:21", name="Old", rssi=-30, phy_hint="ble")],
+        {},
+    )
+    check(len(stale) == 1 and stale[0].rssi is None, "cached device without a new advert is quiet")
     check(bt_match(named[0], Target(mode="name", value="kit")), "name substring")
     check(not bt_match(devices[1], Target(mode="name", value="Kitchen")), "other device skipped")
 
@@ -2871,14 +3400,21 @@ BSS aa:bb:cc:dd:ee:05(on wlx0)
     check(view.trend == "CLOSING", f"trend closing, got {view.trend}")
     check(view.distance_m is not None and 20 < view.distance_m < 50, "distance populated")
 
+    lone_floor, lone_ceil = signal_window([-42.0])
+    lone = proximity_fraction(-42.0, lone_floor, lone_ceil)
+    check(lone is not None and 0.4 < lone < 0.6, "a steady signal sits mid-graph")
+    walk_floor, walk_ceil = signal_window([-70.0, -40.0])
+    check((proximity_fraction(-40.0, walk_floor, walk_ceil) or 0) > 0.85, "close end of a walk fills the graph")
+    check((proximity_fraction(-70.0, walk_floor, walk_ceil) or 1) < 0.15, "far end of a walk drops the graph")
+    history = [-75, -70, -65, -60, -55, -50, -45, -40]
     far = View(
         "Loft", "Jeff", "Home", "AA:BB:CC:DD:EE:01", "Wi-Fi", "wlx0", "ch 6",
-        -90, -90, estimate_distance_m(-90, 2437, 20), "HOLDING", 0.0, [],
+        -74, -74, estimate_distance_m(-74, 2437, 20), "FALLING BACK", -4.0, history,
         2437, 20, True, 0.2, "", 3, "far",
     )
     near = View(
         "Loft", "Jeff", "Home", "AA:BB:CC:DD:EE:01", "Wi-Fi", "wlx0", "locked ch 6",
-        -40, -40, estimate_distance_m(-40, 2437, 20), "CLOSING", 6.0, [],
+        -40, -40, estimate_distance_m(-40, 2437, 20), "CLOSING", 6.0, history,
         2437, 20, True, 0.2, "", 9, "sights",
     )
     far_txt = render_sight(far, width=80, height=25, color=False)
@@ -2886,6 +3422,10 @@ BSS aa:bb:cc:dd:ee:05(on wlx0)
     check(near_txt.count("█") > far_txt.count("█") > 0, "bar grows as the signal rises")
     check("CLOSING" in near_txt and "THE MARKSMAN" in near_txt, "sight text")
     check(len(render_sight(near, width=80, height=24, color=False).splitlines()) <= 24, "fits 24 rows")
+    wide = render_sight(near, width=140, height=42, color=False).splitlines()
+    narrow = render_sight(near, width=80, height=24, color=False).splitlines()
+    check(len(wide) == 42 and len(narrow) == 24, "sight uses the terminal height")
+    check(len(wide[0]) > len(narrow[0]), "sight uses the terminal width")
     check("IN THE SIGHTS" in near_txt or "CLOSE" in near_txt or zone_word(near.zone) in near_txt, "zone word")
 
     class FakeSource:
