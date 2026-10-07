@@ -52,12 +52,29 @@ The script lists whatever is plugged in and lets you pick. A soft block on the c
 
 `sudo` is required for the Wi-Fi scan and for monitor mode.
 
+## Setup
+
+`--setup` downloads and installs the system packages the hunter runs. It does not install Kismet. The Marksman talks to `iw` and BlueZ directly.
+
+| Distro | Installer | Packages |
+| --- | --- | --- |
+| Debian, Ubuntu, Pop!_OS, Mint, Kali | `apt` | `iw`, `iproute2`, `rfkill`, `bluez`, `network-manager`, `systemd`, `python3` |
+| Fedora, RHEL, Rocky, Alma | `dnf` | `iw`, `iproute`, `util-linux`, `bluez`, `NetworkManager`, `systemd`, `python3` |
+| Arch, Manjaro, EndeavourOS | `pacman` | `iw`, `iproute2`, `util-linux`, `bluez`, `bluez-utils`, `networkmanager`, `systemd`, `python` |
+
+It also enables `bluetooth.service` and adds the login user to the `bluetooth` group when that group exists. Log out and back in after a group change. Wi-Fi monitor mode still needs `sudo`.
+
+```bash
+sudo python3 marksman.py --setup
+```
+
 ## Quick start
 
 ```bash
 git clone https://github.com/scjeff/The-Marksman.git
 cd The-Marksman
 
+sudo python3 marksman.py --setup
 python3 marksman.py --check
 sudo python3 marksman.py
 ```
@@ -206,6 +223,7 @@ A 10 dB error (ordinary multipath, or a phone that is not actually at the assume
 
 | Flag | Meaning |
 | --- | --- |
+| `--setup` | Download and install `iw`, BlueZ, `rfkill`, and NetworkManager (needs sudo) |
 | `--i-have-roe` | Confirm signed ROE / written authorization (required when not a TTY) |
 | `--operator-name NAME` | Operator full name |
 | `--userid ID` | UserID or employee ID |
@@ -244,6 +262,7 @@ Do not commit capture output. The session directory is in `.gitignore`.
 
 | Symptom | What to check |
 | --- | --- |
+| `iw`, `bluetoothctl`, or `busctl` missing | `sudo python3 marksman.py --setup` |
 | `iw scan` says operation not permitted | `sudo python3 marksman.py` |
 | No Wi-Fi controllers | USB adapter seated; `python3 marksman.py --check` |
 | Soft-blocked | The hunt unblocks the chosen radio and blocks it again on exit |

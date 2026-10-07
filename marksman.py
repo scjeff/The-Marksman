@@ -21,6 +21,7 @@ Authorized use only. No injection, deauthentication, association,
 Bluetooth pairing, connect, or GATT. Distance uses the same log-distance
 model as The Magic Flute (n = 2.7).
 
+    sudo python3 marksman.py --setup
     sudo python3 marksman.py
 """
 
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import grp
 import json
 import math
 import os
@@ -48,6 +50,13 @@ from pathlib import Path
 
 TOOL_NAME = "The Marksman"
 VERSION = "1.0.0"
+# Binaries the hunt calls. nmcli is used when NetworkManager is present.
+REQUIRED_TOOLS = ("iw", "ip", "rfkill", "busctl", "bluetoothctl")
+OPTIONAL_TOOLS = ("nmcli",)
+# Package names that provide those binaries. systemd provides busctl.
+DEB_PACKAGES = ["iw", "iproute2", "rfkill", "bluez", "network-manager", "systemd", "python3"]
+FEDORA_PACKAGES = ["iw", "iproute", "util-linux", "bluez", "NetworkManager", "systemd", "python3"]
+ARCH_PACKAGES = ["iw", "iproute2", "util-linux", "bluez", "bluez-utils", "networkmanager", "systemd", "python"]
 PATH_LOSS_EXPONENT = 2.7
 WIFI_AP_TX_DBM = 20.0
 WIFI_CLIENT_TX_DBM = 15.0
@@ -161,7 +170,11 @@ def which(name: str) -> str | None:
     return None
 
 
-def run_cmd(args: list[str], timeout: float = 10) -> subprocess.CompletedProcess[str]:
+def run_cmd(
+    args: list[str],
+    timeout: float = 10,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             args,
@@ -169,6 +182,7 @@ def run_cmd(args: list[str], timeout: float = 10) -> subprocess.CompletedProcess
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         out = exc.stdout if isinstance(exc.stdout, str) else ""
@@ -2168,13 +2182,220 @@ def open_session(path: Path, session: dict) -> None:
     (path / "operator_session.json").write_text(json.dumps(session, indent=2) + "\n", encoding="utf-8")
 
 
+def os_release() -> dict[str, str]:
+    info: dict[str, str] = {}
+    path = Path("/etc/os-release")
+    if not path.exists():
+        return info
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" not in line or line.startswith("#"):
+            continue
+        key, val = line.split("=", 1)
+        info[key] = val.strip().strip('"')
+    return info
+
+
+def package_manager_for(info: dict[str, str]) -> str:
+    os_id = (info.get("ID") or "").lower()
+    like = (info.get("ID_LIKE") or "").lower()
+    if os_id in {"debian", "ubuntu", "linuxmint", "pop", "raspbian", "kali"} or "debian" in like:
+        return "apt"
+    if os_id in {"fedora", "rhel", "centos", "rocky", "almalinux"} or "fedora" in like or "rhel" in like:
+        return "dnf"
+    if os_id in {"arch", "manjaro", "endeavouros"} or "arch" in like:
+        return "pacman"
+    return ""
+
+
+def packages_for(manager: str) -> list[str]:
+    if manager == "apt":
+        return list(DEB_PACKAGES)
+    if manager == "dnf":
+        return list(FEDORA_PACKAGES)
+    if manager == "pacman":
+        return list(ARCH_PACKAGES)
+    return []
+
+
+def real_username() -> str:
+    return os.environ.get("SUDO_USER") or os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+
+
+def user_group_names(username: str) -> set[str]:
+    names: set[str] = set()
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        return names
+    try:
+        names.add(grp.getgrgid(pw.pw_gid).gr_name)
+    except KeyError:
+        pass
+    try:
+        extra = os.getgrouplist(username, pw.pw_gid)
+    except (AttributeError, OSError):
+        extra = []
+        for entry in grp.getgrall():
+            if username in entry.gr_mem:
+                extra.append(entry.gr_gid)
+    for gid in extra:
+        try:
+            names.add(grp.getgrgid(gid).gr_name)
+        except KeyError:
+            pass
+    return names
+
+
+def group_exists(name: str) -> bool:
+    try:
+        grp.getgrnam(name)
+        return True
+    except KeyError:
+        return False
+
+
+def apt_package_known(name: str) -> bool:
+    if not which("apt-cache"):
+        return True
+    proc = run_cmd(["apt-cache", "show", name], timeout=30)
+    return proc.returncode == 0 and "Package:" in (proc.stdout or "")
+
+
+def _apt_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    env["NEEDRESTART_MODE"] = "a"
+    return env
+
+
+def install_packages() -> bool:
+    info = os_release()
+    manager = package_manager_for(info)
+    packages = packages_for(manager)
+    if not manager:
+        distro = info.get("PRETTY_NAME") or info.get("ID") or "this distro"
+        log(
+            f"No installer for {distro}. Install iw, iproute2, rfkill, bluez, and NetworkManager yourself.",
+            "err",
+        )
+        return False
+    if os.geteuid() != 0:
+        log(f"Package install needs root. Re-run: sudo python3 {Path(sys.argv[0]).name} --setup", "err")
+        return False
+    if manager == "apt":
+        env = _apt_env()
+        log("Downloading package lists (apt-get update)…")
+        upd = run_cmd(["apt-get", "update"], timeout=300, env=env)
+        if upd.returncode != 0:
+            log((upd.stderr or upd.stdout or "apt-get update failed").strip()[:1500], "warn")
+        known = [pkg for pkg in packages if apt_package_known(pkg)]
+        missing = [pkg for pkg in packages if pkg not in known]
+        if missing:
+            log(f"Not in the apt cache, skipped: {' '.join(missing)}", "warn")
+        packages = known
+        if not packages:
+            log("apt does not know any of the required packages.", "err")
+            return False
+        log(f"Installing with apt: {' '.join(packages)}")
+        proc = run_cmd(
+            [
+                "apt-get",
+                "install",
+                "-y",
+                "-o",
+                "Dpkg::Options::=--force-confdef",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+                *packages,
+            ],
+            timeout=600,
+            env=env,
+        )
+    elif manager == "dnf":
+        log(f"Installing with dnf: {' '.join(packages)}")
+        proc = run_cmd(["dnf", "install", "-y", *packages], timeout=600)
+    else:
+        log(f"Installing with pacman: {' '.join(packages)}")
+        proc = run_cmd(["pacman", "-Sy", "--noconfirm", *packages], timeout=600)
+    if proc.returncode != 0:
+        log((proc.stderr or proc.stdout or "package install failed").strip()[:2000], "err")
+        return all(which(name) for name in REQUIRED_TOOLS)
+    log("Packages installed.", "ok")
+    return True
+
+
+def enable_bluetooth_service() -> None:
+    systemctl = which("systemctl")
+    if not systemctl:
+        log("systemctl is not available. Start bluetoothd yourself if Bluetooth hunts fail.", "warn")
+        return
+    proc = run_cmd([systemctl, "enable", "--now", "bluetooth.service"], timeout=40)
+    if proc.returncode == 0:
+        log("bluetooth.service is enabled and running.", "ok")
+        return
+    detail = (proc.stderr or proc.stdout or "could not start bluetooth.service").strip()
+    log(detail[:500], "warn")
+
+
+def ensure_bluetooth_group(username: str) -> None:
+    if not username or username == "root":
+        log("No login user to add to the bluetooth group.", "warn")
+        return
+    if not group_exists("bluetooth"):
+        log("No bluetooth group on this system. BlueZ may still allow your user through polkit.", "warn")
+        return
+    if "bluetooth" in user_group_names(username):
+        log(f"{username} is already in the bluetooth group.", "ok")
+        return
+    proc = run_cmd(["usermod", "-aG", "bluetooth", username])
+    if proc.returncode == 0:
+        log(f"Added {username} to bluetooth. Log out and back in so that group applies.", "ok")
+    else:
+        log((proc.stderr or "usermod bluetooth failed").strip()[:400], "warn")
+
+
+def tools_missing() -> list[str]:
+    return [name for name in REQUIRED_TOOLS if not which(name)]
+
+
+def run_setup() -> int:
+    print()
+    log(
+        "Setup downloads and installs iw, iproute2, rfkill, BlueZ (bluetoothctl), "
+        "and NetworkManager (nmcli). busctl comes with systemd.",
+        "hdr",
+    )
+    if os.geteuid() != 0:
+        log(
+            f"Re-run as root: sudo python3 {Path(sys.argv[0]).name} --setup",
+            "err",
+        )
+        missing = tools_missing()
+        if missing:
+            log("Missing now: " + ", ".join(missing), "warn")
+        else:
+            log("The required tools are already on PATH. Setup still needs root to refresh them.", "warn")
+        return 2
+    ok = install_packages()
+    enable_bluetooth_service()
+    ensure_bluetooth_group(real_username())
+    print()
+    code = run_check()
+    if not ok or tools_missing():
+        log("Setup did not leave every required tool on PATH.", "err")
+        return 1
+    log("Setup finished.", "ok")
+    log(f"Then run: sudo python3 {Path(sys.argv[0]).name}")
+    return 0 if code == 0 else code
+
+
 def run_check(list_only: bool = False) -> int:
     print(f"Python {sys.version.split()[0]}")
     ok = True
-    for name in ("iw", "ip", "rfkill", "busctl", "bluetoothctl", "nmcli"):
+    for name in (*REQUIRED_TOOLS, *OPTIONAL_TOOLS):
         path = which(name)
         mark = path or "missing"
-        if name in {"iw", "ip", "busctl"} and not path:
+        if name in REQUIRED_TOOLS and not path:
             ok = False
         print(f"  {name:<12} {mark}")
     print()
@@ -2203,7 +2424,10 @@ def run_check(list_only: bool = False) -> int:
     if ok:
         log("Tools are present. Authorization is still required before a hunt.", "ok")
         return 0
-    log("A required tool is missing.", "err")
+    log(
+        f"A required tool is missing. Run: sudo python3 {Path(sys.argv[0]).name} --setup",
+        "err",
+    )
     return 1
 
 
@@ -2223,6 +2447,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration", type=float, default=0, help="stop the sight after N seconds")
     parser.add_argument("--scan-window", type=float, default=8, help="seconds to listen before the Bluetooth list")
     parser.add_argument("--dry-run", action="store_true", help="record the plan and do not touch the radio")
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="download and install iw, BlueZ, rfkill, and NetworkManager (needs sudo)",
+    )
     parser.add_argument("--list-only", action="store_true", help="list controllers and exit")
     parser.add_argument("--check", action="store_true", help="check tools and controllers")
     parser.add_argument("--self-test", action="store_true", help="run the offline self-test")
@@ -2422,6 +2651,8 @@ def main(argv: list[str] | None = None) -> int:
         log("Python 3.9 or newer is required.", "err")
         return 1
     print_banner()
+    if args.setup:
+        return run_setup()
     if args.check or args.list_only:
         return run_check(list_only=args.list_only)
     try:
@@ -2673,6 +2904,16 @@ BSS aa:bb:cc:dd:ee:05(on wlx0)
     reason = run_sight(FakeSource(), fake_state, fake_stats, None, 0.35)
     check(reason == "quit", "sight loop ends on duration")
     check(fake_stats.frames > 0, "sight loop records frames")
+    check(package_manager_for({"ID": "pop", "ID_LIKE": "ubuntu debian"}) == "apt", "pop uses apt")
+    check(package_manager_for({"ID": "ubuntu"}) == "apt", "ubuntu uses apt")
+    check(package_manager_for({"ID": "fedora"}) == "dnf", "fedora uses dnf")
+    check(package_manager_for({"ID": "arch"}) == "pacman", "arch uses pacman")
+    check(package_manager_for({"ID": "gentoo"}) == "", "unknown distro has no installer")
+    apt_pkgs = packages_for("apt")
+    check("iw" in apt_pkgs and "bluez" in apt_pkgs and "iproute2" in apt_pkgs, "apt package list")
+    check("bluez-utils" in packages_for("pacman"), "arch bluetoothctl package")
+    check("NetworkManager" in packages_for("dnf"), "fedora NetworkManager package")
+    check(build_parser().parse_args(["--setup"]).setup is True, "setup flag")
 
     if failures:
         for message in failures:
