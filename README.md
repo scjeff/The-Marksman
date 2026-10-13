@@ -152,9 +152,9 @@ Wi-Fi, after you pick a controller:
 
 Each row is marked `AP`, `device`, or `ad-hoc`. A home router is an AP. A Roku, a phone, or a Samsung oven that is joined to that router is a `device`: it does not advertise the router's name, so choosing the router follows the router. Choose the device row, or type its MAC with `7`.
 
-A hidden SSID is listed by MAC. If several access points share a name, the list keeps the strongest one, and the sight follows whichever AP with that name is loudest. A `device` or hidden row is locked by MAC, and the sight uses frames that MAC transmitted (data, probes, and beacons), not frames the access point sends toward it.
+A hidden SSID is listed by MAC. If several access points share a name, the list keeps the strongest one. The sight stays on that radio's frequency and uses whichever beacon with that name is loudest there. A `device` or hidden row is locked by MAC, and the sight uses frames that MAC transmitted (data, probes, and beacons), not frames the access point sends toward it.
 
-The listen spends most of its time on 2.4 GHz, where appliances usually sit, then checks 5 GHz when the adapter has it. `--scan-window` is that listen (default 8 seconds) plus the access-point scan.
+The listen spends most of its time on 2.4 GHz, where appliances usually sit, then checks 5 GHz and, when the adapter has it, 6 GHz preferred scanning channels. `--scan-window` is that listen (default 8 seconds) plus the access-point scan.
 
 Bluetooth:
 
@@ -166,7 +166,7 @@ Bluetooth:
 | `7` | Type a MAC address |
 | `q` | Quit |
 
-A device with no name is shown as its MAC. A typed name matches exactly, ignoring case, or as a substring of one advertised name. The sight then stays on that MAC. Devices Bluetooth already knew about, but that did not advertise during this listen, are left off the five.
+A device with no name is shown as its MAC. A typed name matches exactly, ignoring case, or as a substring of at least two characters. A single character matches only a device with that exact name. The sight then stays on that MAC. Devices Bluetooth already knew about, but that did not advertise during this listen, are left off the five.
 
 `0` is also on the sight page. There it leaves the sight, listens again, and redraws the list.
 
@@ -189,7 +189,7 @@ Locking either a Wi-Fi mark or a Bluetooth mark opens the same picture, and it u
 
 On a terminal that is not a TTY, the sight prints one status line per second instead of the full screen.
 
-Wi-Fi with a known channel stays on that channel in monitor mode. A MAC or SSID that was not in the scan is searched by walking 2.4 GHz and, when the adapter has it, 5 GHz, then the radio stays on the channel where the mark was heard. If monitor mode is not available, the sight falls back to a slow `iw scan` about every 4 seconds. That fallback only sees access points. A client MAC needs monitor mode, and it needs the driver to deliver data frames. Some built-in Intel cards pass beacons only; a USB adapter is the better radio for a Roku, a phone, or an appliance.
+Wi-Fi with a known frequency stays on that frequency in monitor mode. The tune uses the scanned frequency, so a 6 GHz network is not sent to 2.4 GHz just because the channel number matches. A MAC or SSID that was not in the scan is searched by walking 2.4 GHz, then 5 GHz, then 6 GHz when the adapter has it. The radio then stays on the frequency where the mark was heard. If monitor mode is not available, the sight falls back to a slow `iw scan` about every 4 seconds. That fallback only sees access points. A client MAC needs monitor mode, and it needs the driver to deliver data frames. Some built-in Intel cards pass beacons only; a USB adapter is the better radio for a Roku, a phone, or an appliance.
 
 Bluetooth keeps a `bluetoothctl` session open for the whole hunt, so the adapter keeps scanning after the command that started it. Duplicate advertisements stay on, and the level can change while you walk. If the first listen hears nothing, a second listen asks for low-energy advertisements only. Discovery is stopped on exit.
 
@@ -210,11 +210,12 @@ Assumed transmit power, used only when the device does not advertise one between
 | Radio | Assumed TX |
 | --- | ---: |
 | Wi-Fi AP, and any SSID hunt | 20 dBm |
+| Ad-hoc (IBSS) beacon | 20 dBm |
 | Other Wi-Fi (a client MAC, until it beacons) | 15 dBm |
 | Bluetooth classic (BR/EDR) | 4 dBm |
 | BLE (an address type was present) | 0 dBm |
 
-Bluetooth frequency is taken as 2402 MHz, the same stand-in The Magic Flute uses when a Bluetooth radio has no channel of its own. Wi-Fi uses the channel the frame or the scan reported.
+Bluetooth frequency is taken as 2402 MHz, the same stand-in The Magic Flute uses when a Bluetooth radio has no channel of its own. Wi-Fi uses the frequency the frame or the scan reported.
 
 Worked examples at `n = 2.7`:
 
@@ -239,8 +240,8 @@ A 10 dB error (ordinary multipath, or a phone that is not actually at the assume
 | `--ssid NAME` | Lock this SSID (Wi-Fi) |
 | `--mac AA:BB:CC:DD:EE:FF` | Lock this MAC |
 | `--bt-name NAME` | Lock this Bluetooth name |
-| `--duration N` | Leave the sight after N seconds |
-| `--scan-window N` | Seconds to listen for Wi-Fi clients and Bluetooth devices before the list (default 8) |
+| `--duration N` | Leave the sight after N seconds. `0` stays up until you quit. A negative value is rejected |
+| `--scan-window N` | Seconds to listen for Wi-Fi clients and Bluetooth devices before the list (default 8). A negative value is rejected. Below 1 second is raised to 1 |
 | `-o DIR` | Session directory (default `./marksman_<timestamp>/`) |
 | `--dry-run` | Print the plan and do not touch the radio |
 | `--list-only` | Print controllers and exit |
@@ -257,7 +258,7 @@ Default directory: `marksman_YYYYMMDDTHHMMSSZ/`
 | --- | --- |
 | `operator_session.json` | Name, UserID, scan name, authorization, adapter, target |
 | `marksman_track.csv` | Sight samples while the mark is being heard. Appended and synced as the hunt runs, so a crash keeps completed rows. |
-| `marksman_report.txt` | Short text report, including closest and furthest estimates |
+| `marksman_report.txt` | Short text report, including closest and furthest estimates. Ctrl-C still writes this from the samples collected so far |
 | `marksman_report.md` | The same summary in Markdown |
 
 `marksman_track.csv` columns include `signal_dbm`, `signal_smooth_dbm`, `distance_m`, `trend`, `tx_dbm`, `frequency_mhz`, and `path_loss_exponent` (always `2.7`). Rows are written about twice a second, and only while the mark has been heard in the last second. Quiet gaps are not filled in.
@@ -270,7 +271,7 @@ Do not commit capture output. The session directory is in `.gitignore`.
 | --- | --- |
 | `iw`, `bluetoothctl`, or `busctl` missing | `sudo python3 marksman.py --setup` |
 | `iw scan` says operation not permitted | `sudo python3 marksman.py` |
-| No Wi-Fi controllers | USB adapter seated; `python3 marksman.py --check` |
+| No Wi-Fi controllers | USB adapter seated; `python3 marksman.py --check`. An adapter left in monitor mode is still listed |
 | Soft-blocked | The hunt unblocks the chosen radio and blocks it again on exit |
 | Hard-blocked | Flip the airplane / wireless switch |
 | Monitor mode failed, slow scan instead | The driver did not expose radiotap. The sight still works for access points, a few seconds per update. Client devices need monitor mode |

@@ -45,12 +45,12 @@ import termios
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
 TOOL_NAME = "The Marksman"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 # Binaries the hunt calls. nmcli is used when NetworkManager is present.
 REQUIRED_TOOLS = ("iw", "ip", "rfkill", "busctl", "bluetoothctl")
 OPTIONAL_TOOLS = ("nmcli",)
@@ -89,6 +89,8 @@ RADIOTAP_HEAD = {
 
 HOP_24 = [1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13]
 HOP_5 = [36, 40, 44, 48, 149, 153, 157, 161, 165, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140]
+# 6 GHz preferred scanning channels. Channel numbers collide with 2.4 GHz, so these are MHz.
+HOP_6 = [5950.0 + 5.0 * ch for ch in range(5, 233, 16)]
 ARPHRD_IEEE80211_RADIOTAP = 803
 
 RESET = "\033[0m"
@@ -299,7 +301,7 @@ def format_distance_csv(meters: float | None) -> str:
 
 
 def assumed_tx(phy_hint: str) -> float:
-    if phy_hint == "wifi-ap":
+    if phy_hint in {"wifi-ap", "wifi-ibss"}:
         return WIFI_AP_TX_DBM
     if phy_hint == "wifi-client":
         return WIFI_CLIENT_TX_DBM
@@ -339,7 +341,29 @@ def channel_for_mhz(freq: float | None) -> int | None:
         channel = (f - 5000) // 5
         if 32 <= channel <= 177:
             return channel
+    # 6 GHz channel numbers restart at 1. 5955 MHz is channel 1.
+    if 5955 <= f <= 7115 and (f - 5955) % 5 == 0:
+        channel = (f - 5950) // 5
+        if 1 <= channel <= 233:
+            return channel
     return None
+
+
+def lock_freq(channel: int | None, freq: float | None) -> float | None:
+    """MHz to tune. A measured frequency wins over a channel number.
+
+    6 GHz reuses channel numbers 1–14, so channel 5 is 2432 MHz on 2.4 GHz
+    and 5975 MHz on 6 GHz. Tuning from the channel alone leaves the radio
+    on the wrong band.
+    """
+    try:
+        if freq is not None and math.isfinite(float(freq)):
+            freq_f = float(freq)
+            if 2000.0 <= freq_f <= 7125.0:
+                return freq_f
+    except (TypeError, ValueError):
+        pass
+    return mhz_for_channel(channel)
 
 
 def signal_window(values: list[float]) -> tuple[float, float]:
@@ -976,8 +1000,10 @@ def run_sight(source, state: SightState, stats: HuntStats, track: "TrackLog | No
         sys.stdout.write(ALT_ON + CURSOR_HIDE)
         sys.stdout.flush()
     started = time.monotonic()
-    last_draw = 0.0
-    last_log = 0.0
+    # A non-TTY prints once a second. Seed the clock from now so the first
+    # line waits, and so a short self-test does not print a status line.
+    last_draw = started if not tty else started - 0.1
+    last_log = started - 0.5
     reason = "quit"
     try:
         while True:
@@ -985,16 +1011,23 @@ def run_sight(source, state: SightState, stats: HuntStats, track: "TrackLog | No
             if duration and now - started >= duration:
                 reason = "quit"
                 break
+            error_note = ""
             try:
                 sample = source.poll()
             except RadioError as exc:
-                state.note = str(exc)
+                error_note = str(exc)
                 sample = None
             fresh = sample is not None
             if fresh:
                 state.fold(sample, now)
             state.detail = getattr(source, "status", state.detail)
-            state.note = getattr(source, "note", state.note) or state.note
+            source_note = getattr(source, "note", "") or ""
+            if error_note and not source_note and not fresh:
+                state.note = error_note
+            elif source_note:
+                state.note = source_note
+            elif fresh:
+                state.note = ""
             key = ""
             if tty:
                 try:
@@ -1086,14 +1119,24 @@ def parse_iw_scan(text: str) -> list[Hit]:
         sig_m = re.search(r"(?m)^\s*signal:\s*(-?[0-9]+(?:\.[0-9]+)?)\s*dBm", chunk)
         ssid_m = re.search(r"(?m)^\s*SSID:\s*(.*)$", chunk)
         ch_m = re.search(r"DS Parameter set:\s*channel\s+(\d+)", chunk)
+        cap_m = re.search(r"(?m)^\s*capability:\s*(.*)$", chunk)
         freq = float(freq_m.group(1)) if freq_m else None
         rssi = float(sig_m.group(1)) if sig_m else None
         if rssi is not None and (rssi >= 0.0 or rssi < -120.0):
             rssi = None
         ssid = ssid_m.group(1).strip() if ssid_m else ""
-        channel = int(ch_m.group(1)) if ch_m else channel_for_mhz(freq)
-        if freq is None and channel:
-            freq = mhz_for_channel(channel)
+        # Frequency wins. A 6 GHz "channel 5" is 5975 MHz, not 2.4 GHz channel 5.
+        if freq is not None:
+            channel = channel_for_mhz(freq)
+        else:
+            channel = int(ch_m.group(1)) if ch_m else None
+            if channel:
+                freq = mhz_for_channel(channel)
+        phy = "wifi-ap"
+        if cap_m:
+            tokens = set(re.findall(r"[A-Za-z]+", cap_m.group(1)))
+            if "IBSS" in tokens and "ESS" not in tokens:
+                phy = "wifi-ibss"
         hits.append(
             Hit(
                 mac=mac_m.group(1).upper(),
@@ -1101,7 +1144,7 @@ def parse_iw_scan(text: str) -> list[Hit]:
                 rssi=rssi,
                 freq_mhz=freq,
                 channel=channel,
-                phy_hint="wifi-ap",
+                phy_hint=phy,
             )
         )
     return hits
@@ -1502,9 +1545,10 @@ class RfkillHold:
 
 
 def classify_wifi(iface: str, driver: str) -> tuple[str, bool]:
-    if driver in {"mt7921u", "mt76x2u", "mt7921e", "rt2800usb"} or iface.startswith("wlx"):
-        return "USB Wi-Fi (preferred hunter)", True
-    if is_usb_net(iface):
+    usb_preferred = driver in {"mt7921u", "mt76x2u", "rt2800usb"} or iface.startswith("wlx")
+    if usb_preferred or is_usb_net(iface):
+        if usb_preferred:
+            return "USB Wi-Fi (preferred hunter)", True
         return "USB Wi-Fi", True
     if driver == "iwlwifi":
         return "Built-in Intel Wi-Fi", False
@@ -1519,10 +1563,10 @@ def list_wifi_controllers() -> list[dict]:
         iface = row["iface"]
         if iface.startswith(("lo", "docker", "veth", "br-", "tun", "kismon")):
             continue
-        if row.get("type") == "monitor":
-            continue
         driver = net_driver(iface)
         hint, recommended = classify_wifi(iface, driver)
+        if row.get("type") == "monitor":
+            hint = f"{hint} (left in monitor mode)"
         info = phy_info(row.get("phy") or "")
         kill = rfkill_for([row.get("phy") or "", iface])
         kill_s = "unknown"
@@ -1669,12 +1713,12 @@ class WifiPort:
         self.monitor = False
         self.touched = False
 
-    def open_monitor(self, channel: int | None) -> None:
+    def open_monitor(self, channel: int | None = None, freq: float | None = None) -> None:
         if not valid_iface(self.iface):
             raise RadioError(f"Refusing interface name {self.iface!r}.")
         if self.monitor and self.sock is not None:
-            if channel:
-                self.tune(channel)
+            if lock_freq(channel, freq):
+                self.tune(channel, freq)
             return
         iw = which("iw")
         ip = which("ip")
@@ -1708,20 +1752,21 @@ class WifiPort:
         # otherbss asks the driver for frames from networks we are not joined to.
         # Built-in Intel cards often hide client data without it.
         run_cmd([iw, "dev", self.iface, "set", "monitor", "otherbss"], timeout=4)
-        if channel:
-            self.tune(channel)
+        if lock_freq(channel, freq):
+            self.tune(channel, freq)
 
-    def tune(self, channel: int) -> bool:
-        freq = mhz_for_channel(channel)
-        if freq is None:
+    def tune(self, channel: int | None = None, freq: float | None = None) -> bool:
+        freq_f = lock_freq(channel, freq)
+        if freq_f is None:
             return False
         iw = which("iw") or "iw"
-        proc = run_cmd([iw, "dev", self.iface, "set", "freq", str(int(freq))], timeout=4)
+        proc = run_cmd([iw, "dev", self.iface, "set", "freq", str(int(round(freq_f)))], timeout=4)
         if proc.returncode != 0:
             self.note = (proc.stderr or proc.stdout or "channel change failed").strip().splitlines()[-1][:80]
             return False
-        self.channel = channel
-        self.freq = freq
+        self.freq = freq_f
+        derived = channel_for_mhz(freq_f)
+        self.channel = derived if derived is not None else channel
         self.note = ""
         return True
 
@@ -1742,11 +1787,21 @@ class WifiPort:
         return frames
 
 
-def hop_channels(bands: list[str]) -> list[int]:
-    channels = list(HOP_24)
+def hop_freqs(bands: list[str]) -> list[float]:
+    """Frequencies to walk. 6 GHz is included only when the adapter reports it."""
+    freqs: list[float] = []
+    for channel in HOP_24:
+        freq = mhz_for_channel(channel)
+        if freq:
+            freqs.append(freq)
     if not bands or any(band.startswith("5") or band.startswith("6") for band in bands):
-        channels.extend(HOP_5)
-    return channels
+        for channel in HOP_5:
+            freq = mhz_for_channel(channel)
+            if freq:
+                freqs.append(freq)
+    if any(band.startswith("6") for band in bands):
+        freqs.extend(HOP_6)
+    return freqs
 
 
 class WifiSource:
@@ -1756,15 +1811,26 @@ class WifiSource:
         self.mode = mode
         self.status = "starting"
         self.note = ""
-        self.hops = hop_channels(port.bands)
+        self.hops = hop_freqs(port.bands)
         self.hop_i = 0
         self.last_tune = 0.0
-        self.fixed = target.channel is not None
-        self.locked = target.channel is not None
-        if self.mode == "monitor" and target.channel:
-            self.status = f"watching ch {target.channel}"
+        self.fixed = lock_freq(target.channel, target.freq_mhz) is not None
+        self.locked = self.fixed
+        place = self._place(target.freq_mhz, target.channel)
+        if self.mode == "monitor" and place:
+            self.status = f"watching {place}"
         elif self.mode == "monitor":
             self.status = "searching"
+
+    @staticmethod
+    def _place(freq: float | None, channel: int | None) -> str:
+        if freq and freq >= 5925:
+            return f"{freq:.0f} MHz"
+        if channel:
+            return f"ch {channel}"
+        if freq:
+            return f"{freq:.0f} MHz"
+        return ""
 
     def poll(self) -> Sample | None:
         if self.mode != "monitor":
@@ -1779,10 +1845,11 @@ class WifiSource:
             self.locked = True
         elif not self.fixed and not self.locked and time.monotonic() - self.last_tune >= 0.25:
             self._hop()
-        if self.locked and self.port.channel:
-            self.status = f"locked ch {self.port.channel}"
-        elif self.port.channel:
-            self.status = f"searching ch {self.port.channel}"
+        place = self._place(self.port.freq, self.port.channel)
+        if self.locked and place:
+            self.status = f"locked {place}"
+        elif place:
+            self.status = f"searching {place}"
         else:
             self.status = "searching"
         self.note = self.port.note
@@ -1817,12 +1884,10 @@ class WifiSource:
     def _hop(self) -> None:
         if not self.hops:
             return
-        channel = self.hops[self.hop_i % len(self.hops)]
+        freq = self.hops[self.hop_i % len(self.hops)]
         self.hop_i += 1
-        if self.port.tune(channel):
-            self.last_tune = time.monotonic()
-        else:
-            self.last_tune = time.monotonic()
+        self.port.tune(None, freq)
+        self.last_tune = time.monotonic()
 
     def _scan_once(self) -> Sample | None:
         now = time.monotonic()
@@ -1889,9 +1954,9 @@ def wifi_scan(iface: str) -> list[Hit]:
 def listen_stations(port: WifiPort, seconds: float, skip_mac: str = "") -> list[Hit]:
     """Hop in monitor mode and collect radios that transmit, including clients."""
     port.open_monitor(HOP_24[0])
-    channels = hop_channels(port.bands)
-    band24 = [channel for channel in channels if channel <= 14]
-    band5 = [channel for channel in channels if channel > 14]
+    plan = hop_freqs(port.bands)
+    band24 = [freq for freq in plan if freq < 3000]
+    band_high = [freq for freq in plan if freq >= 3000]
     deadline = time.monotonic() + max(0.5, seconds)
     # Appliances and ad-hoc gear are usually on 2.4 GHz. Spend most of the window there.
     split = time.monotonic() + max(0.5, seconds) * 0.7
@@ -1903,11 +1968,11 @@ def listen_stations(port: WifiPort, seconds: float, skip_mac: str = "") -> list[
         while True:
             now = time.monotonic()
             remaining = deadline - now
-            plan = band24 if (now < split or not band5) else band5
-            if not plan:
-                plan = channels or list(HOP_24)
+            band = band24 if (now < split or not band_high) else band_high
+            if not band:
+                band = plan or [mhz_for_channel(HOP_24[0]) or 2412.0]
             if now - last >= 0.28:
-                port.tune(plan[hop_i % len(plan)])
+                port.tune(None, band[hop_i % len(band)])
                 hop_i += 1
                 last = now
             for frame in port.drain(160):
@@ -2450,7 +2515,8 @@ def find_mac(hits: list[Hit], mac: str) -> Hit | None:
 def find_bt_name(hits: list[Hit], name: str) -> Hit | None:
     want = name.casefold()
     exact = [hit for hit in hits if hit.name.casefold() == want]
-    pool = exact or [hit for hit in hits if want in hit.name.casefold()]
+    partial = [hit for hit in hits if len(want) >= 2 and want in hit.name.casefold()]
+    pool = exact or partial
     if not pool:
         return None
     pool.sort(key=lambda hit: hit.rssi if hit.rssi is not None else -999, reverse=True)
@@ -2580,8 +2646,9 @@ def write_reports(outdir: Path, session: dict, stats_book: dict[str, HuntStats])
         for key, stats in stats_book.items():
             strong = "" if stats.max_rssi is None else f"{stats.max_rssi:.1f}"
             weak = "" if stats.min_rssi is None else f"{stats.min_rssi:.1f}"
+            cell = key.replace("|", "\\|").replace("\n", " ")
             md.append(
-                f"| {key} | {stats.frames} | {strong} | {weak} | "
+                f"| {cell} | {stats.frames} | {strong} | {weak} | "
                 f"{format_distance_human(stats.closest_m)} | {format_distance_human(stats.furthest_m)} |"
             )
         md.append("")
@@ -2974,8 +3041,14 @@ def hunt_one(source, state: SightState, stats: HuntStats, track: TrackLog | None
     return run_sight(source, state, stats, track, duration)
 
 
-def wifi_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Namespace, preset: Target | None) -> dict[str, HuntStats]:
-    book: dict[str, HuntStats] = {}
+def wifi_flow(
+    ctrl: dict,
+    session: dict,
+    outdir: Path,
+    args: argparse.Namespace,
+    preset: Target | None,
+    book: dict[str, HuntStats],
+) -> dict[str, HuntStats]:
     track = TrackLog(outdir / "marksman_track.csv")
     port = WifiPort(ctrl["iface"], list(ctrl.get("bands") or []))
     hits: list[Hit] = []
@@ -3035,16 +3108,16 @@ def wifi_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Namespace,
             session["target_mac"] = target.mac
             mode = "monitor"
             try:
-                port.open_monitor(target.channel)
-                if target.channel is None and port.monitor:
-                    port.tune(port.channel or HOP_24[0])
+                port.open_monitor(target.channel, target.freq_mhz)
+                if port.monitor and not port.freq:
+                    port.tune(HOP_24[0])
             except RadioError as exc:
                 log(f"Monitor mode unavailable ({exc}). Falling back to a slow iw scan.", "warn")
                 port.close()
                 mode = "scan"
             source = WifiSource(port, target, mode)
             if mode == "monitor":
-                if target.channel is None and not port.channel:
+                if lock_freq(target.channel, target.freq_mhz) is None and not port.freq:
                     source._hop()
                 source.last_tune = time.monotonic()
             stats = book.setdefault(target.key(), HuntStats(target.key()))
@@ -3060,8 +3133,14 @@ def wifi_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Namespace,
     return book
 
 
-def bluetooth_flow(ctrl: dict, session: dict, outdir: Path, args: argparse.Namespace, preset: Target | None) -> dict[str, HuntStats]:
-    book: dict[str, HuntStats] = {}
+def bluetooth_flow(
+    ctrl: dict,
+    session: dict,
+    outdir: Path,
+    args: argparse.Namespace,
+    preset: Target | None,
+    book: dict[str, HuntStats],
+) -> dict[str, HuntStats]:
     track = TrackLog(outdir / "marksman_track.csv")
     bluez = Bluez(ctrl["iface"], ctrl.get("mac") or "")
     window = min(60.0, max(1.0, float(args.scan_window)))
@@ -3127,6 +3206,14 @@ def main(argv: list[str] | None = None) -> int:
     if sys.version_info < MIN_PYTHON:
         log("Python 3.9 or newer is required.", "err")
         return 1
+    if (
+        args.duration < 0
+        or args.scan_window < 0
+        or not math.isfinite(args.duration)
+        or not math.isfinite(args.scan_window)
+    ):
+        log("--duration and --scan-window must be finite numbers, zero or greater.", "err")
+        return 1
     print_banner()
     if args.setup:
         return run_setup()
@@ -3187,6 +3274,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     outdir = Path(args.output) if args.output else Path.cwd() / f"marksman_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
     hold = RfkillHold()
+    # Filled in place so Ctrl-C still has the samples when the report is written.
     book: dict[str, HuntStats] = {}
     try:
         names = [ctrl["iface"]]
@@ -3196,9 +3284,9 @@ def main(argv: list[str] | None = None) -> int:
         open_session(outdir, session)
         log(f"Session directory: {outdir}", "ok")
         if kind == "wifi":
-            book = wifi_flow(ctrl, session, outdir, args, preset)
+            wifi_flow(ctrl, session, outdir, args, preset, book)
         else:
-            book = bluetooth_flow(ctrl, session, outdir, args, preset)
+            bluetooth_flow(ctrl, session, outdir, args, preset, book)
         return 0
     except KeyboardInterrupt:
         log("Stopped.", "warn")
@@ -3238,9 +3326,18 @@ def self_test() -> int:
     check(tx == 0 and assumed, "ble assumed tx")
     tx, assumed = resolve_tx("bt-classic", None)
     check(tx == 4 and assumed, "classic assumed tx")
+    tx, assumed = resolve_tx("wifi-ibss", None)
+    check(tx == 20 and assumed, "ibss assumed tx is an AP, not BLE")
     check(normalize_mac("aa-bb-cc-dd-ee-ff") == "AA:BB:CC:DD:EE:FF", "mac normalize")
     check(normalize_mac("nope") is None, "mac reject")
     check(channel_for_mhz(2412) == 1 and mhz_for_channel(6) == 2437, "channel map")
+    check(channel_for_mhz(5180) == 36, "5 GHz channel")
+    check(channel_for_mhz(5975) == 5, "6 GHz channel 5")
+    check(lock_freq(5, 5975) == 5975, "6 GHz frequency wins over channel 5")
+    check(lock_freq(5, None) == 2432, "channel 5 alone is 2.4 GHz")
+    check(5975 in hop_freqs(["2.4 GHz", "6 GHz"]), "6 GHz hop")
+    check(5975 not in hop_freqs(["2.4 GHz", "5 GHz"]), "no 6 GHz hop without that band")
+    check(5180 in hop_freqs(["2.4 GHz", "5 GHz"]), "5 GHz hop")
     check(interpret_choice("0") == ("rescan", None), "choice 0")
     check(interpret_choice("5") == ("slot", 4), "choice 5")
     check(interpret_choice("6") == ("manual-name", None), "choice 6")
@@ -3277,6 +3374,24 @@ BSS aa:bb:cc:dd:ee:05(on wlx0)
     check([hit.name for hit in top] == ["Zoo", "Home", "Guest"], "ssid rank")
     check(top[1].mac == "AA:BB:CC:DD:EE:01", "strongest BSSID kept for an SSID")
     check(all(hit.name for hit in top), "hidden ssid dropped")
+    six = parse_iw_scan(
+        """
+BSS aa:bb:cc:dd:ee:06(on wlp0)
+	freq: 5975
+	signal: -40.00 dBm
+	SSID: Six
+	DS Parameter set: channel 5
+BSS aa:bb:cc:dd:ee:07(on wlp0)
+	freq: 2412
+	signal: -44.00 dBm
+	SSID: AdhocNet
+	capability: IBSS ShortSlotTime (0x0402)
+"""
+    )
+    check(len(six) == 2, "six and ibss parsed")
+    check(six[0].freq_mhz == 5975 and six[0].channel == 5, "6 GHz hit keeps frequency")
+    check(lock_freq(six[0].channel, six[0].freq_mhz) == 5975, "6 GHz hit tunes 5975")
+    check(six[1].phy_hint == "wifi-ibss", "iw IBSS capability")
 
     def rt(present_words: list[int], fields: bytes) -> bytes:
         blob = b"".join(struct.pack("<I", word) for word in present_words)
@@ -3387,6 +3502,12 @@ BSS aa:bb:cc:dd:ee:05(on wlx0)
     check(len(stale) == 1 and stale[0].rssi is None, "cached device without a new advert is quiet")
     check(bt_match(named[0], Target(mode="name", value="kit")), "name substring")
     check(not bt_match(devices[1], Target(mode="name", value="Kitchen")), "other device skipped")
+    alpha = Hit(mac="AA:BB:CC:DD:EE:30", name="Alpha", rssi=-40, phy_hint="ble")
+    bee = Hit(mac="AA:BB:CC:DD:EE:31", name="Bee", rssi=-50, phy_hint="ble")
+    check(find_bt_name([alpha, bee], "a") is None, "one-letter name is not a substring")
+    check(find_bt_name([alpha, bee], "alp").name == "Alpha", "name substring of two")
+    lone = find_bt_name([Hit(mac="AA:BB:CC:DD:EE:32", name="A", rssi=-40, phy_hint="ble")], "A")
+    check(lone is not None and lone.name == "A", "one-letter exact name still matches")
 
     state = SightState("Loft", "Jeff", "Wi-Fi", "wlx0", Target(mode="ssid", value="Home", display="Home", phy_hint="wifi-ap", freq_mhz=2437))
     stamp = 0.0
