@@ -25,7 +25,8 @@ What the radios do:
 
 - The Wi-Fi **sight** is monitor mode, receive only. It does not inject frames, deauthenticate clients, or associate.
 - The Wi-Fi **list** uses a normal `iw scan` (that scan sends probe requests), then a short monitor-mode listen for phones, appliances, and ad-hoc radios. The listen is receive only.
-- Bluetooth uses BlueZ discovery on the built-in adapter (standard inquiry and LE scan, including scan requests). It does **not** pair, connect, or read GATT. An Ubertooth is not used.
+- Bluetooth on the built-in adapter uses BlueZ discovery (standard inquiry and LE scan, including scan requests). It does **not** pair, connect, or read GATT.
+- An Ubertooth One, when it is plugged in, is a receive-only BTLE advertising sniffer on channel 37 (`ubertooth-btle -n`). It does not follow connections, transmit, pair, or read GATT.
 
 Collection starts only after you type `YES` (interactive) or pass `--i-have-roe`. That acknowledgement is stored with the session.
 
@@ -47,7 +48,7 @@ Any Linux host with `iw`, `ip`, `rfkill`, and BlueZ (`bluetoothctl`, plus `busct
 | Role | What works | Notes |
 | --- | --- | --- |
 | Wi-Fi | USB adapter with **monitor mode** | Preferred. MediaTek mt76 / Panda-class (`mt7921u` and similar) are marked preferred. A built-in radio is listed too. |
-| Bluetooth | BlueZ `hci` controller | The built-in adapter, including a Dell Intel card, is the radio this program uses. Discovery stays open for the whole hunt. An Ubertooth is not required. |
+| Bluetooth | BlueZ `hci` controller, or an Ubertooth One | The built-in adapter works, including a Dell Intel card. An Ubertooth One (`1d50:6002`) is listed as `ubertooth-0` and is preferred when `ubertooth-btle` is installed and the stick is not in DFU mode. The hunt listens for advertisements on channel 37. It does not follow connections. |
 
 The script lists whatever is plugged in and lets you pick. A soft block on the chosen radio is lifted for the hunt and put back on exit. A hardware kill switch cannot be overridden.
 
@@ -85,7 +86,7 @@ At start the script:
 1. Prints the authorized-use notice. Type `YES` only if you have lawful authorization.
 2. Asks for **operator name**, **UserID or employee ID**, and **scan name**.
 3. Asks whether this hunt is **Wi-Fi** or **Bluetooth**.
-4. Lists controllers for that radio and asks you to pick one. USB monitor-capable Wi-Fi adapters are marked preferred.
+4. Lists controllers for that radio and asks you to pick one. USB monitor-capable Wi-Fi adapters are marked preferred. An Ubertooth One is marked preferred for Bluetooth when it is plugged in and not in DFU mode.
 5. Listens, then shows the target page.
 6. Opens the sight picture for the mark you chose. Press **Ctrl-C**, **q**, or **b** to leave it.
 
@@ -150,9 +151,11 @@ Wi-Fi, after you pick a controller:
 | `7` | Type a MAC address |
 | `q` | Quit |
 
-Each row is marked `AP`, `device`, or `ad-hoc`. A home router is an AP. A Roku, a phone, or a Samsung oven that is joined to that router is a `device`: it does not advertise the router's name, so choosing the router follows the router. Choose the device row, or type its MAC with `7`.
+Each of the five rows is three columns: **MAC address**, **manufacturer**, **SSID**. The manufacturer comes from the IEEE assignment for that MAC. A locally administered address is labeled as such. A hidden network, or a client that sent no name, has an em dash in the SSID column and is still chosen by its MAC.
 
-A hidden SSID is listed by MAC. If several access points share a name, the list keeps the strongest one. The sight stays on that radio's frequency and uses whichever beacon with that name is loudest there. A `device` or hidden row is locked by MAC, and the sight uses frames that MAC transmitted (data, probes, and beacons), not frames the access point sends toward it.
+A home router advertises an SSID. A Roku, a phone, or an oven that is joined to that router usually does not, so choosing the router's row follows the router. Choose the device row, or type its MAC with `7`.
+
+If several access points share a name, the list keeps the strongest one. The sight stays on that radio's frequency and uses whichever beacon with that name is loudest there. A client or hidden row is locked by MAC, and the sight uses frames that MAC transmitted (data, probes, and beacons), not frames the access point sends toward it.
 
 The listen spends most of its time on 2.4 GHz, where appliances usually sit, then checks 5 GHz and, when the adapter has it, 6 GHz preferred scanning channels. `--scan-window` is that listen (default 8 seconds) plus the access-point scan.
 
@@ -166,7 +169,9 @@ Bluetooth:
 | `7` | Type a MAC address |
 | `q` | Quit |
 
-A device with no name is shown as its MAC. A typed name matches exactly, ignoring case, or as a substring of at least two characters. A single character matches only a device with that exact name. The sight then stays on that MAC. Devices Bluetooth already knew about, but that did not advertise during this listen, are left off the five.
+Each of the five rows is three columns: **MAC address**, **manufacturer**, **device name**. A public address uses the IEEE assignment. A random BLE address with no company name in the advertisement is labeled `Random BLE address`. An advertisement that names a company, including one the Ubertooth prints, uses that name. A device with no advertised name has an em dash in the name column.
+
+A typed name matches exactly, ignoring case, or as a substring of at least two characters. A single character matches only a device with that exact name. The sight then stays on that MAC. Devices Bluetooth already knew about, but that did not advertise during this listen, are left off the five.
 
 `0` is also on the sight page. There it leaves the sight, listens again, and redraws the list.
 
@@ -191,7 +196,9 @@ On a terminal that is not a TTY, the sight prints one status line per second ins
 
 Wi-Fi with a known frequency stays on that frequency in monitor mode. The tune uses the scanned frequency, so a 6 GHz network is not sent to 2.4 GHz just because the channel number matches. A MAC or SSID that was not in the scan is searched by walking 2.4 GHz, then 5 GHz, then 6 GHz when the adapter has it. The radio then stays on the frequency where the mark was heard. If monitor mode is not available, the sight falls back to a slow `iw scan` about every 4 seconds. That fallback only sees access points. A client MAC needs monitor mode, and it needs the driver to deliver data frames. Some built-in Intel cards pass beacons only; a USB adapter is the better radio for a Roku, a phone, or an appliance.
 
-Bluetooth keeps a `bluetoothctl` session open for the whole hunt, so the adapter keeps scanning after the command that started it. Duplicate advertisements stay on, and the level can change while you walk. If the first listen hears nothing, a second listen asks for low-energy advertisements only. Discovery is stopped on exit.
+Bluetooth on a built-in adapter keeps a `bluetoothctl` session open for the whole hunt, so the adapter keeps scanning after the command that started it. Duplicate advertisements stay on, and the level can change while you walk. If the first listen hears nothing, a second listen asks for low-energy advertisements only. Discovery is stopped on exit.
+
+An Ubertooth One does not use BlueZ. The hunt runs `ubertooth-btle -n -U N`, which only receives advertising packets on channel 37 (2402 MHz). It does not follow a connection, transmit, pair, or read GATT. Names and company names come from those advertisements. The process is stopped on exit. Install the tool with the `ubertooth` package (`apt install ubertooth` on Debian and Ubuntu). `--setup` does not install it. A stick in DFU mode (`1d50:6003`) is listed, and a hunt on it asks you to unplug it and plug it back in.
 
 ## Distance estimate
 
@@ -236,7 +243,7 @@ A 10 dB error (ordinary multipath, or a phone that is not actually at the assume
 | `--userid ID` | UserID or employee ID |
 | `--scan-name NAME` | Name of this scan |
 | `--phy wifi` / `--phy bluetooth` | Skip the radio question |
-| `--iface IFACE` | Skip the controller question (`wlx…` or `hci0`) |
+| `--iface IFACE` | Skip the controller question (`wlx…`, `hci0`, or `ubertooth-0`) |
 | `--ssid NAME` | Lock this SSID (Wi-Fi) |
 | `--mac AA:BB:CC:DD:EE:FF` | Lock this MAC |
 | `--bt-name NAME` | Lock this Bluetooth name |
@@ -276,7 +283,9 @@ Do not commit capture output. The session directory is in `.gitignore`.
 | Hard-blocked | Flip the airplane / wireless switch |
 | Monitor mode failed, slow scan instead | The driver did not expose radiotap. The sight still works for access points, a few seconds per update. Client devices need monitor mode |
 | Router is listed, a Roku or oven is not | Those are clients. They show up as `device` only when they transmit during the listen. Choosing the home SSID follows the router. Enter the device MAC with `7` if you know it. A built-in Intel card that only passes beacons will not see them; use a USB adapter |
-| Bluetooth list stays empty | The radio must be unblocked and `bluetoothd` running. Devices have to be awake and advertising. Press `0` to listen again. Unnamed devices are listed by MAC. This program uses the built-in adapter, not an Ubertooth |
+| Ubertooth is not listed | `lsusb` should show `1d50:6002`. Install the `ubertooth` package so `ubertooth-btle` is on PATH. A stick in DFU mode is `1d50:6003`; unplug it and plug it back in. `--setup` does not install that package |
+| Bluetooth list stays empty on the built-in adapter | The radio must be unblocked and `bluetoothd` running. Devices have to be awake and advertising. Press `0` to listen again. A device with no name has an em dash in the name column |
+| Bluetooth list stays empty on the Ubertooth | The stick only hears advertising channel 37. Devices have to be advertising. It does not follow a connection. Press `0` to listen again |
 | Sight says LOST | The mark went quiet or you left its channel. `0` rescans. `b` returns to the list |
 | Column sits in one place | It recenters when the last minute of signal barely moved. Walk farther. The dBm number is the absolute level |
 | Distance looks absurd | The assumed TX power is probably wrong. Trust CLOSING / FALLING BACK over the meter number |

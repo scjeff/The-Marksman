@@ -18,7 +18,8 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 Authorized use only. No injection, deauthentication, association,
-Bluetooth pairing, connect, or GATT. Distance uses the same log-distance
+Bluetooth pairing, connect, or GATT. An Ubertooth One, if present, only
+receives BTLE advertisements. Distance uses the same log-distance
 model as The Magic Flute (n = 2.7).
 
     sudo python3 marksman.py --setup
@@ -37,6 +38,7 @@ import pwd
 import re
 import select
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -50,10 +52,11 @@ from pathlib import Path
 
 
 TOOL_NAME = "The Marksman"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 # Binaries the hunt calls. nmcli is used when NetworkManager is present.
+# ubertooth-btle is optional: a missing name must not fail --setup on dnf.
 REQUIRED_TOOLS = ("iw", "ip", "rfkill", "busctl", "bluetoothctl")
-OPTIONAL_TOOLS = ("nmcli",)
+OPTIONAL_TOOLS = ("nmcli", "ubertooth-btle")
 # Package names that provide those binaries. systemd provides busctl.
 DEB_PACKAGES = ["iw", "iproute2", "rfkill", "bluez", "network-manager", "systemd", "python3"]
 FEDORA_PACKAGES = ["iw", "iproute", "util-linux", "bluez", "NetworkManager", "systemd", "python3"]
@@ -75,6 +78,11 @@ MIN_PYTHON = (3, 9)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 BT_NEW_RE = re.compile(r"\[NEW\] Device ([0-9A-Fa-f:]{17})(?:\s+(.*))?$")
 BT_CHG_RE = re.compile(r"\[CHG\] Device ([0-9A-Fa-f:]{17}) ([A-Za-z]+): (.*)$")
+# Ubertooth One (firmware) and the DFU/ISP bootloader.
+UBERTOOTH_USB_IDS = {("1d50", "6002"), ("1d50", "6003")}
+COL_MAC = 17
+COL_VENDOR = 24
+COL_NAME = 22
 
 # Radiotap fields that can sit before DBM_ANTSIGNAL (bit 5).
 # (size, alignment from the start of the radiotap header).
@@ -124,9 +132,11 @@ DISCLAIMER = """\
   Wi-Fi sight: monitor mode, receive only. No injection, deauthentication,
   or association. The list uses a normal scan (probe requests), then a short
   receive-only listen for phones, appliances, and ad-hoc radios.
-  Bluetooth: BlueZ discovery on the built-in adapter, the standard inquiry
-  and LE scan. That scan transmits scan requests. It does not pair, connect,
-  or read GATT. An Ubertooth is not required.
+  Bluetooth on the built-in adapter is BlueZ discovery: the standard
+  inquiry and LE scan, including scan requests. It does not pair, connect,
+  or read GATT. An Ubertooth One, when it is plugged in, only receives
+  BTLE advertisements on channel 37. It does not follow connections,
+  transmit, or read GATT.
 """
 
 TRACK_FIELDS = [
@@ -238,6 +248,106 @@ def usable_name(name: str, mac: str = "") -> str:
     if normalize_mac(cleaned) and not re.search(r"[A-Za-z]", cleaned):
         return ""
     return cleaned
+
+
+_IEEE_TABLE: dict[str, str] | None = None
+
+
+def _load_ieee_csv(table: dict[str, str], path: Path) -> None:
+    """Merge one IEEE or Flute vendor file. Later files overwrite the same prefix."""
+    if not path.is_file():
+        return
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace", newline="")
+    except OSError:
+        return
+    with handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            return
+        fields = {name.strip().lower(): name for name in reader.fieldnames if name}
+        assign = fields.get("assignment") or fields.get("prefix")
+        org = fields.get("organization name") or fields.get("vendor")
+        if not assign or not org:
+            return
+        for row in reader:
+            prefix = re.sub(r"[^0-9A-Fa-f]", "", row.get(assign) or "").upper()
+            vendor = (row.get(org) or "").strip().strip('"')
+            if prefix and vendor:
+                table[prefix] = vendor
+
+
+def ieee_table() -> dict[str, str]:
+    """OUI table. A CSV beside this script wins, then The Magic Flute's, then the system files."""
+    global _IEEE_TABLE
+    if _IEEE_TABLE is not None:
+        return _IEEE_TABLE
+    table: dict[str, str] = {}
+    script = Path(__file__).resolve().parent
+    for path in (
+        Path("/usr/share/ieee-data/oui36.csv"),
+        Path("/usr/share/ieee-data/mam.csv"),
+        Path("/usr/share/ieee-data/oui.csv"),
+        script.parent / "The-Magic-Flute" / "ieee_mac_vendors.csv",
+        script / "ieee_mac_vendors.csv",
+    ):
+        _load_ieee_csv(table, path)
+    _IEEE_TABLE = table
+    return table
+
+
+def lookup_ieee(mac: str, table: dict[str, str] | None = None) -> str:
+    """Longest IEEE prefix: MA-S (36 bit), then MA-M (28 bit), then MA-L (24 bit)."""
+    book = ieee_table() if table is None else table
+    hexmac = re.sub(r"[^0-9A-Fa-f]", "", mac or "").upper()
+    if len(hexmac) < 6 or not book:
+        return ""
+    for width in (9, 7, 6):
+        if len(hexmac) >= width:
+            vendor = book.get(hexmac[:width])
+            if vendor:
+                return vendor
+    return ""
+
+
+def mac_locally_administered(mac: str) -> bool:
+    parts = (mac or "").split(":")
+    try:
+        return bool(int(parts[0], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+
+def ble_address_is_random(mac: str, address_type: str, phy_hint: str) -> bool:
+    """BLE random addresses are not IEEE OUIs. Public addresses still use the OUI."""
+    kind = (address_type or "").casefold()
+    if "random" in kind:
+        return True
+    if "public" in kind:
+        return False
+    if phy_hint != "ble":
+        return False
+    parts = (mac or "").split(":")
+    try:
+        first = int(parts[0], 16)
+    except (ValueError, IndexError):
+        return False
+    msbs = (first >> 6) & 0x3
+    return msbs in {1, 3} or bool(first & 0x02)
+
+
+def manufacturer_label(hit: Hit, table: dict[str, str] | None = None) -> str:
+    stamped = (hit.manufacturer or "").strip()
+    if stamped:
+        return stamped
+    found = lookup_ieee(hit.mac, table)
+    if found:
+        return found
+    if ble_address_is_random(hit.mac, hit.address_type, hit.phy_hint):
+        return "Random BLE address"
+    if mac_locally_administered(hit.mac):
+        return "Locally administered MAC"
+    return "Unknown"
 
 
 def iso_utc(when: float | None = None) -> str:
@@ -541,6 +651,7 @@ class Hit:
     phy_hint: str = "wifi-ap"
     advertised_tx: float | None = None
     address_type: str = ""
+    manufacturer: str = ""
 
     def tx(self) -> tuple[float, bool]:
         return resolve_tx(self.phy_hint, self.advertised_tx)
@@ -1600,6 +1711,82 @@ def list_wifi_controllers() -> list[dict]:
     return items
 
 
+def iter_usb_devices() -> list[dict]:
+    rows: list[dict] = []
+    root = Path("/sys/bus/usb/devices")
+    if not root.is_dir():
+        return rows
+    for node in root.iterdir():
+        vendor = read_sysfs(node / "idVendor").lower()
+        product = read_sysfs(node / "idProduct").lower()
+        if not vendor or not product:
+            continue
+        rows.append(
+            {
+                "sys": str(node),
+                "vendor": vendor,
+                "product": product,
+                "manufacturer": read_sysfs(node / "manufacturer"),
+                "name": read_sysfs(node / "product"),
+                "serial": read_sysfs(node / "serial"),
+                "bus": read_sysfs(node / "busnum"),
+                "dev": read_sysfs(node / "devnum"),
+            }
+        )
+    return rows
+
+
+def describe_ubertooth(index: int, usb: dict, tool: str | None) -> dict:
+    """One Ubertooth row for the controller list. DFU is listed and not recommended."""
+    product = (usb.get("product") or "").lower()
+    dfu = product == "6003"
+    vendor = (usb.get("vendor") or "1d50").lower()
+    serial = usb.get("serial") or ""
+    maker = usb.get("manufacturer") or "Great Scott Gadgets"
+    product_name = usb.get("name") or "Ubertooth One"
+    if dfu:
+        hint = "Ubertooth One (DFU — unplug and plug back in)"
+    elif not tool:
+        hint = "Ubertooth One (ubertooth-btle is not installed)"
+    else:
+        hint = "Ubertooth One"
+    detail = [
+        f"usb={vendor}:{product or '6002'}  serial={serial or '-'}  {maker}  {product_name}",
+        "Passive BTLE advertisements on channel 37 (ubertooth-btle -n). No follow, no pairing.",
+    ]
+    if dfu:
+        detail.append("This stick is in DFU mode. Unplug it and plug it back in.")
+    if not tool:
+        detail.append("Install the ubertooth package so ubertooth-btle is on PATH. --setup does not install it.")
+    return {
+        "iface": f"ubertooth-{index}",
+        "mac": "",
+        "name": product_name,
+        "source_type": "ubertooth",
+        "ubertooth_index": index,
+        "dfu": dfu,
+        "recommended": (not dfu) and bool(tool),
+        "label": f"ubertooth-{index}  {hint}",
+        "detail": detail,
+    }
+
+
+def list_ubertooth_devices() -> list[dict]:
+    tool = which("ubertooth-btle")
+    hits = [row for row in iter_usb_devices() if (row["vendor"], row["product"]) in UBERTOOTH_USB_IDS]
+
+    def sort_key(row: dict) -> tuple:
+        try:
+            bus = int(row.get("bus") or 0)
+            dev = int(row.get("dev") or 0)
+        except ValueError:
+            bus, dev = 0, 0
+        return (bus, dev, row.get("sys") or "")
+
+    hits.sort(key=sort_key)
+    return [describe_ubertooth(index, usb, tool) for index, usb in enumerate(hits)]
+
+
 def list_bt_controllers() -> list[dict]:
     listed: dict[str, str] = {}
     btctl = which("bluetoothctl")
@@ -1651,6 +1838,7 @@ def list_bt_controllers() -> list[dict]:
                 "iface": iface,
                 "mac": mac,
                 "name": name,
+                "source_type": "bluez",
                 "recommended": powered == "yes" and kill_s != "hard-blocked",
                 "label": f"{iface}  {hint}" + (f"  ({name})" if name else ""),
                 "detail": [
@@ -1659,14 +1847,24 @@ def list_bt_controllers() -> list[dict]:
                 ],
             }
         )
-    if items:
-        # Prefer a single powered controller when several exist; keep the first powered one marked.
-        powered = [item for item in items if item.get("recommended")]
-        if len(powered) > 1:
-            for item in powered[1:]:
-                item["recommended"] = False
-    items.sort(key=lambda item: (not item.get("recommended"), item["iface"]))
-    return items
+    # One preferred BlueZ radio. An Ubertooth stays recommended on its own.
+    powered = [item for item in items if item.get("recommended")]
+    if len(powered) > 1:
+        for item in powered[1:]:
+            item["recommended"] = False
+    found = list_ubertooth_devices() + items
+
+    def rank(item: dict) -> tuple:
+        if item.get("source_type") == "ubertooth" and item.get("recommended"):
+            group = 0
+        elif item.get("recommended"):
+            group = 1
+        else:
+            group = 2
+        return (group, item["iface"])
+
+    found.sort(key=rank)
+    return found
 
 
 def iface_arphrd(iface: str) -> int:
@@ -2369,6 +2567,343 @@ class Bluez:
         return value
 
 
+_SYSTIME_RE = re.compile(
+    r"^systime=\d+\s+freq=(\d+)\s+addr=([0-9a-fA-F]+).*?\brssi=(-?\d+)"
+)
+_ADV_HDR_RE = re.compile(r"^Advertising\s+/")
+_DATA_HDR_RE = re.compile(r"^Data\s+/")
+_TYPE_RE = re.compile(r"^\s*Type:\s+(\S+)")
+_ADVA_RE = re.compile(r"^\s*AdvA:\s+([0-9A-Fa-f:]{17})\s+\((\w+)\)")
+_SCANA_RE = re.compile(r"^\s*ScanA:\s+([0-9A-Fa-f:]{17})\s+\((\w+)\)")
+_CHAN_RE = re.compile(r"^\s*Channel Index:\s*(\d+)")
+_AD_TYPE_RE = re.compile(r"Type\s+([0-9A-Fa-f]{2})\b")
+_COMPANY_RE = re.compile(r"Company:\s*(.+?)\s*$")
+_TX_RE = re.compile(r"(-?\d+)\s*dBm")
+_HEX_BYTES_RE = re.compile(r"^(?:[0-9A-Fa-f]{2})(?:\s+[0-9A-Fa-f]{2})*$")
+_UBERTOOTH_FAIL_RE = re.compile(
+    r"(no ubertooth|ubertooth not found|permission denied|could not open|failed to open|libusb)",
+    re.IGNORECASE,
+)
+_ADV_PDUS = {
+    "ADV_IND",
+    "ADV_DIRECT_IND",
+    "ADV_NONCONN_IND",
+    "ADV_SCAN_IND",
+    "SCAN_RSP",
+}
+
+
+def ubertooth_btle_command(index: int, binary: str = "ubertooth-btle") -> list[str]:
+    """Passive advertising receive. Channel 37 is the tool's default. No follow, no transmit."""
+    if index < 0 or index > 7:
+        raise RadioError(f"Ubertooth index {index} is outside 0-7.")
+    return [binary, "-n", "-U", str(index)]
+
+
+def _text_from_ubertooth_name(text: str) -> str:
+    text = text.strip()
+    if not _HEX_BYTES_RE.fullmatch(text):
+        return text
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        return ""
+    if not raw or any(byte < 32 or byte > 126 for byte in raw):
+        return ""
+    return raw.decode("ascii").strip()
+
+
+class _UbertoothFold:
+    """Turn ubertooth-btle -n text into Hits. One packet ends at its CRC line."""
+
+    def __init__(self) -> None:
+        self._reset()
+
+    def _reset(self) -> None:
+        self.started = False
+        self.kind = ""
+        self.pdu = ""
+        self.rssi: float | None = None
+        self.freq: float | None = None
+        self.mac = ""
+        self.address_type = ""
+        self.scan_mac = ""
+        self.scan_type = ""
+        self.name = ""
+        self.manufacturer = ""
+        self.channel: int | None = None
+        self.advertised_tx: float | None = None
+        self._expect = ""
+
+    def feed(self, line: str) -> Hit | None:
+        raw = line.rstrip("\n")
+        header = _SYSTIME_RE.match(raw.strip())
+        finished: Hit | None = None
+        if header and self.started:
+            finished = self.finish()
+        if header:
+            self._reset()
+            self.started = True
+            try:
+                freq = float(header.group(1))
+                rssi = float(header.group(3))
+            except ValueError:
+                freq, rssi = None, None
+            self.freq = freq
+            # Printed rssi is already rssi_min - 54. Keep only a plausible dBm value.
+            if rssi is not None and -120.0 < rssi < 0.0:
+                self.rssi = rssi
+            return finished
+        if not self.started:
+            return None
+        if raw.strip().startswith("CRC:"):
+            return self.finish()
+        if self._expect and self._take_expect(raw):
+            return None
+        self._read_field(raw)
+        return None
+
+    def _take_expect(self, raw: str) -> bool:
+        text = raw.strip()
+        if not text:
+            return True
+        if (
+            _TYPE_RE.match(text)
+            or _ADVA_RE.match(text)
+            or _SCANA_RE.match(text)
+            or _CHAN_RE.match(text)
+            or text.startswith("Type ")
+            or text.startswith("Company:")
+            or text.startswith("Data:")
+            or text.startswith("CRC:")
+            or text.startswith("Advertising /")
+            or text.startswith("Data /")
+        ):
+            self._expect = ""
+            return False
+        kind = self._expect
+        self._expect = ""
+        if kind == "name":
+            self.name = text
+        elif kind == "short" and not self.name:
+            self.name = _text_from_ubertooth_name(text)
+        elif kind == "tx":
+            found = _TX_RE.search(text)
+            if found:
+                try:
+                    self.advertised_tx = float(found.group(1))
+                except ValueError:
+                    pass
+        return True
+
+    def _read_field(self, raw: str) -> None:
+        if _ADV_HDR_RE.match(raw):
+            self.kind = "adv"
+            return
+        if _DATA_HDR_RE.match(raw):
+            self.kind = "data"
+            return
+        typed = _TYPE_RE.match(raw)
+        if typed:
+            self.pdu = typed.group(1)
+            return
+        adva = _ADVA_RE.match(raw)
+        if adva:
+            self.mac = adva.group(1)
+            self.address_type = adva.group(2)
+            return
+        scana = _SCANA_RE.match(raw)
+        if scana:
+            self.scan_mac = scana.group(1)
+            self.scan_type = scana.group(2)
+            return
+        chan = _CHAN_RE.match(raw)
+        if chan:
+            try:
+                self.channel = int(chan.group(1))
+            except ValueError:
+                pass
+            return
+        if "Company:" in raw:
+            company = _COMPANY_RE.search(raw)
+            if company:
+                self.manufacturer = company.group(1).strip()
+            return
+        if raw.strip().startswith("Type "):
+            ad = _AD_TYPE_RE.search(raw)
+            if not ad:
+                return
+            code = ad.group(1).lower()
+            if code == "09":
+                self._expect = "name"
+            elif code == "08":
+                self._expect = "short"
+            elif code == "0a":
+                self._expect = "tx"
+
+    def finish(self) -> Hit | None:
+        if not self.started:
+            return None
+        pdu = self.pdu
+        mac = self.mac
+        addr_type = self.address_type
+        if pdu == "SCAN_REQ":
+            mac = self.scan_mac
+            addr_type = self.scan_type
+        keep = self.kind != "data" and pdu != "CONNECT_REQ"
+        if pdu and pdu not in _ADV_PDUS and pdu != "SCAN_REQ":
+            keep = False
+        normalized = normalize_mac(mac) if keep else None
+        hit = None
+        if normalized:
+            hit = Hit(
+                mac=normalized,
+                name=usable_name(self.name, normalized),
+                rssi=self.rssi,
+                freq_mhz=self.freq or BT_FREQ_MHZ,
+                channel=self.channel,
+                phy_hint="ble",
+                advertised_tx=self.advertised_tx,
+                address_type=addr_type,
+                manufacturer=self.manufacturer.strip(),
+            )
+        self._reset()
+        return hit
+
+
+def parse_ubertooth_text(text: str) -> list[Hit]:
+    folder = _UbertoothFold()
+    hits: list[Hit] = []
+    for line in text.splitlines():
+        done = folder.feed(line)
+        if done is not None:
+            hits.append(done)
+    tail = folder.finish()
+    if tail is not None:
+        hits.append(tail)
+    return hits
+
+
+class Ubertooth:
+    """Receive-only BTLE advertisements from ubertooth-btle -n. Same calls as Bluez."""
+
+    def __init__(self, index: int = 0, dfu: bool = False, binary: str | None = None) -> None:
+        self.index = int(index)
+        self.dfu = bool(dfu)
+        self._binary = binary
+        self.note = ""
+        self.proc: subprocess.Popen[str] | None = None
+        self._fold = _UbertoothFold()
+        self._devices: dict[str, Hit] = {}
+        self._lock = threading.Lock()
+        self._reader: threading.Thread | None = None
+
+    def _merge(self, hit: Hit) -> None:
+        prev = self._devices.get(hit.mac)
+        if prev is None:
+            self._devices[hit.mac] = hit
+            return
+        if hit.rssi is not None:
+            prev.rssi = hit.rssi
+        if hit.name:
+            prev.name = hit.name
+        if hit.manufacturer:
+            prev.manufacturer = hit.manufacturer
+        if hit.advertised_tx is not None:
+            prev.advertised_tx = hit.advertised_tx
+        if hit.address_type:
+            prev.address_type = hit.address_type
+        if hit.channel is not None:
+            prev.channel = hit.channel
+        if hit.freq_mhz:
+            prev.freq_mhz = hit.freq_mhz
+
+    def _ingest(self, line: str) -> None:
+        if _UBERTOOTH_FAIL_RE.search(line):
+            self.note = line.strip()[:160]
+            return
+        hit = self._fold.feed(line)
+        if hit is None:
+            return
+        with self._lock:
+            self.note = ""
+            self._merge(hit)
+
+    def _read_loop(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            return
+        for line in proc.stdout:
+            self._ingest(line)
+        hit = self._fold.finish()
+        if hit is not None:
+            with self._lock:
+                self.note = ""
+                self._merge(hit)
+
+    def open(self) -> None:
+        if self.dfu:
+            raise RadioError("This Ubertooth is in DFU mode. Unplug it and plug it back in.")
+        binary = self._binary if self._binary is not None else which("ubertooth-btle")
+        if not binary:
+            raise RadioError(
+                "ubertooth-btle is not installed. On Debian and Ubuntu: sudo apt install ubertooth"
+            )
+        command = ubertooth_btle_command(self.index, binary)
+        self.proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        self._reader = threading.Thread(target=self._read_loop, name="marksman-ubertooth", daemon=True)
+        self._reader.start()
+        time.sleep(0.4)
+        proc = self.proc
+        if proc is not None and proc.poll() is not None and not self._devices:
+            detail = self.note or (
+                "ubertooth-btle exited. Check that the stick is plugged in and that this user can open it."
+            )
+            self.close()
+            raise RadioError(detail)
+
+    def close(self) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    proc.kill()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    def devices(self) -> list[Hit]:
+        with self._lock:
+            return list(self._devices.values())
+
+    def rssi(self, mac: str) -> float | None:
+        key = normalize_mac(mac) or ""
+        with self._lock:
+            hit = self._devices.get(key)
+            if hit is None or hit.rssi is None:
+                return None
+            return float(hit.rssi)
+
+
 def bt_match(hit: Hit, target: Target) -> bool:
     if target.mac and hit.mac == target.mac:
         return True
@@ -2382,8 +2917,8 @@ def bt_match(hit: Hit, target: Target) -> bool:
 
 
 class BtSource:
-    def __init__(self, bluez: Bluez, target: Target) -> None:
-        self.bluez = bluez
+    def __init__(self, radio, target: Target) -> None:
+        self.radio = radio
         self.target = target
         self.status = "discovering"
         self.note = ""
@@ -2397,14 +2932,14 @@ class BtSource:
             return None
         self.last_poll = now
         if self.target.mac and now - self.last_full < 1.0:
-            rssi = self.bluez.rssi(self.target.mac)
+            rssi = self.radio.rssi(self.target.mac)
             if rssi is not None and self._cached is not None:
                 self.status = "locked"
-                self.note = self.bluez.note
+                self.note = self.radio.note
                 return self._sample(self._cached, rssi)
-        devices = self.bluez.devices()
+        devices = self.radio.devices()
         self.last_full = now
-        self.note = self.bluez.note
+        self.note = self.radio.note
         matches = [hit for hit in devices if bt_match(hit, self.target) and hit.rssi is not None]
         if not matches:
             self.status = "searching" if not self.target.mac else "waiting for RSSI"
@@ -2432,18 +2967,16 @@ class BtSource:
 
 
 def format_hit(hit: Hit) -> str:
-    rssi = f"{hit.rssi:.0f} dBm" if hit.rssi is not None else "   — dBm"
-    dist = format_distance_human(hit.distance())
-    name = clip(hit.name or hit.mac or "(hidden)", 22)
-    channel = f"ch {hit.channel}" if hit.channel else ""
-    role = {
-        "wifi-ap": "AP",
-        "wifi-client": "device",
-        "wifi-ibss": "ad-hoc",
-        "ble": "LE",
-        "bt-classic": "BR",
-    }.get(hit.phy_hint, "")
-    return f"{name:<22} {rssi:>8}  {dist:>8}  {role:<6} {hit.mac}  {channel}".rstrip()
+    """Three columns: MAC, manufacturer, SSID or device name."""
+    mac = clip(hit.mac or "—", COL_MAC).ljust(COL_MAC)
+    vendor = clip(manufacturer_label(hit) or "—", COL_VENDOR).ljust(COL_VENDOR)
+    name = clip(hit.name or "—", COL_NAME).ljust(COL_NAME)
+    return f"{mac}  {vendor}  {name}"
+
+
+def target_header(kind: str) -> str:
+    name = "Name" if kind == "bluetooth" else "SSID"
+    return f"{'MAC address':<{COL_MAC}}  {'Manufacturer':<{COL_VENDOR}}  {name:<{COL_NAME}}"
 
 
 def lock_mode(hit: Hit, kind: str) -> str:
@@ -2463,12 +2996,14 @@ def print_target_page(kind: str, rows: list[Hit], heard: int, note: str = "") ->
     print(Colors.wrap(PINK, "└" + "─" * 72 + "┘"))
     if kind == "wifi":
         print(f"  Heard {heard} transmitters. The list is the five strongest.")
-        print("  AP is an access point. device is a phone, Roku, oven, or other client. ad-hoc is IBSS.")
+        print("  A hidden network, or a client that sent no name, has an em dash in the SSID column.")
     else:
         print(f"  Heard {heard} devices this listen. The list is the five strongest, names or not.")
+        print("  A device with no advertised name has an em dash in the name column.")
     if note:
         print(Colors.wrap(GOLD, "  " + note))
     print(Colors.wrap(GOLD, "  0) rescan"))
+    print(Colors.wrap(DIMC, "     " + target_header(kind)))
     for idx in range(1, 6):
         if idx <= len(rows):
             print(Colors.wrap(CYAN, f"  {idx}) {format_hit(rows[idx - 1])}"))
@@ -2658,11 +3193,11 @@ def write_reports(outdir: Path, session: dict, stats_book: dict[str, HuntStats])
     (outdir / "marksman_report.md").write_text("\n".join(md), encoding="utf-8")
 
 
-def _listen_bt(bluez: Bluez, window: float, seed: list[Hit] | None = None) -> list[Hit]:
+def _listen_bt(radio, window: float, seed: list[Hit] | None = None) -> list[Hit]:
     table: dict[str, Hit] = {hit.mac: hit for hit in (seed or []) if hit.mac}
     deadline = time.monotonic() + window
     while True:
-        for hit in bluez.devices():
+        for hit in radio.devices():
             if hit.mac:
                 table[hit.mac] = hit
         remaining = deadline - time.monotonic()
@@ -2679,18 +3214,24 @@ def _listen_bt(bluez: Bluez, window: float, seed: list[Hit] | None = None) -> li
     return list(table.values())
 
 
-def collect_bt(bluez: Bluez, window: float) -> list[Hit]:
-    hits = _listen_bt(bluez, window)
+def collect_bt(radio, window: float) -> list[Hit]:
+    hits = _listen_bt(radio, window)
+    fresh = [hit for hit in hits if hit.rssi is not None]
+    if fresh:
+        return hits
+    if not hasattr(radio, "retune"):
+        radio.note = radio.note or (
+            "No advertisements yet. The Ubertooth listens on channel 37 only, "
+            "and only while a device is advertising."
+        )
+        return hits
+    log("No Bluetooth advertisements yet. Trying a low-energy scan…", "warn")
+    radio.retune("le")
+    hits = _listen_bt(radio, window, hits)
     fresh = [hit for hit in hits if hit.rssi is not None]
     if not fresh:
-        log("No Bluetooth advertisements yet. Trying a low-energy scan…", "warn")
-        bluez.retune("le")
-        hits = _listen_bt(bluez, window, hits)
-        fresh = [hit for hit in hits if hit.rssi is not None]
-    if not fresh:
-        bluez.note = bluez.note or (
-            "No devices answered. They have to be awake and advertising. "
-            "This uses the built-in adapter. An Ubertooth is not required."
+        radio.note = radio.note or (
+            "No devices answered. They have to be awake and advertising."
         )
     return hits
 
@@ -2958,7 +3499,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--userid", default="", help="user id or employee id")
     parser.add_argument("--scan-name", default="", help="name of this scan")
     parser.add_argument("--phy", choices=["wifi", "bluetooth"], help="which radio to hunt")
-    parser.add_argument("--iface", default="", help="wi-fi iface or hci name")
+    parser.add_argument("--iface", default="", help="wi-fi iface, hci name, or ubertooth-N")
     parser.add_argument("--ssid", default="", help="Wi-Fi SSID to lock")
     parser.add_argument("--mac", default="", help="MAC address to lock")
     parser.add_argument("--bt-name", default="", help="Bluetooth device name to lock")
@@ -3142,26 +3683,29 @@ def bluetooth_flow(
     book: dict[str, HuntStats],
 ) -> dict[str, HuntStats]:
     track = TrackLog(outdir / "marksman_track.csv")
-    bluez = Bluez(ctrl["iface"], ctrl.get("mac") or "")
+    if ctrl.get("source_type") == "ubertooth":
+        radio = Ubertooth(int(ctrl.get("ubertooth_index") or 0), dfu=bool(ctrl.get("dfu")))
+    else:
+        radio = Bluez(ctrl["iface"], ctrl.get("mac") or "")
     window = min(60.0, max(1.0, float(args.scan_window)))
     hits: list[Hit] = []
     need_scan = preset is None
     try:
-        bluez.open()
+        radio.open()
         while True:
             target = preset
             if target is None:
                 if need_scan:
                     log(f"Discovering Bluetooth on {ctrl['iface']} for {window:.0f}s…", "info")
-                    hits = collect_bt(bluez, window)
+                    hits = collect_bt(radio, window)
                     need_scan = False
                 else:
-                    fresh = bluez.devices()
+                    fresh = radio.devices()
                     if fresh:
                         hits = fresh
                 rows = top_hits(hits)
                 heard = len([hit for hit in hits if hit.rssi is not None])
-                note = "" if rows else (bluez.note or "Nothing advertising right now. Press 0 to listen again.")
+                note = "" if rows else (radio.note or "Nothing advertising right now. Press 0 to listen again.")
                 action, slot = prompt_menu("bluetooth", rows, heard, note)
                 if action in {"quit", "back"}:
                     break
@@ -3185,13 +3729,13 @@ def bluetooth_flow(
             state = SightState(
                 session["scan_name"], session["operator_name"], "Bluetooth", ctrl["iface"], target
             )
-            source = BtSource(bluez, target)
+            source = BtSource(radio, target)
             reason = hunt_one(source, state, stats, track, args.duration)
             if preset is not None or reason == "quit" or args.duration:
                 break
             need_scan = reason == "rescan"
     finally:
-        bluez.close()
+        radio.close()
         track.close()
     return book
 
@@ -3277,10 +3821,13 @@ def main(argv: list[str] | None = None) -> int:
     # Filled in place so Ctrl-C still has the samples when the report is written.
     book: dict[str, HuntStats] = {}
     try:
-        names = [ctrl["iface"]]
+        names = []
+        if ctrl.get("source_type") != "ubertooth":
+            names.append(ctrl["iface"])
         if kind == "wifi" and ctrl.get("phy"):
             names.append(ctrl["phy"])
-        hold.open(names)
+        if names:
+            hold.open(names)
         open_session(outdir, session)
         log(f"Session directory: {outdir}", "ok")
         if kind == "wifi":
@@ -3575,6 +4122,145 @@ BSS aa:bb:cc:dd:ee:07(on wlp0)
     check("bluez-utils" in packages_for("pacman"), "arch bluetoothctl package")
     check("NetworkManager" in packages_for("dnf"), "fedora NetworkManager package")
     check(build_parser().parse_args(["--setup"]).setup is True, "setup flag")
+    check("ubertooth" not in " ".join(packages_for("apt")), "setup does not require the ubertooth package")
+    check("ubertooth-btle" in OPTIONAL_TOOLS, "ubertooth-btle is optional")
+
+    oui = {"286FB9": "Nokia", "286FB9001": "Specific"}
+    check(lookup_ieee("28:6F:B9:11:22:33", oui) == "Nokia", "24-bit OUI")
+    check(lookup_ieee("28:6F:B9:00:11:22", oui) == "Specific", "36-bit prefix wins")
+    check(lookup_ieee("00:11:22:33:44:55", oui) == "", "unknown prefix is blank")
+    if Path("/usr/share/ieee-data/oui.csv").is_file():
+        live_vendor = lookup_ieee("28:6F:B9:00:00:00")
+        check("Nokia" in live_vendor, f"system OUI for 28:6F:B9, got {live_vendor!r}")
+    nokia = Hit(mac="28:6F:B9:00:00:01", name="Lobby", rssi=-40, phy_hint="wifi-ap", manufacturer="Nokia")
+    row = format_hit(nokia)
+    header = target_header("wifi")
+    check(row.startswith("28:6F:B9:00:00:01"), "mac is the first column")
+    check(row.index("28:6F:B9:00:00:01") < row.index("Nokia") < row.index("Lobby"), "column order")
+    check(header.index("MAC address") == row.index("28:6F:B9:00:00:01"), "mac column aligns")
+    check(header.index("Manufacturer") == row.index("Nokia"), "vendor column aligns")
+    check(header.index("SSID") == row.index("Lobby"), "ssid column aligns")
+    check("Name" in target_header("bluetooth") and "SSID" not in target_header("bluetooth"), "bluetooth name header")
+    hidden = format_hit(Hit(mac="28:6F:B9:00:00:02", name="", rssi=-40, phy_hint="wifi-ap", manufacturer="Nokia"))
+    check("—" in hidden, "empty name is an em dash")
+    random_ble = Hit(mac="C2:11:22:33:44:55", name="", rssi=-60, phy_hint="ble", address_type="random")
+    check(manufacturer_label(random_ble, {}) == "Random BLE address", "random BLE label")
+    local_wifi = Hit(mac="02:00:00:00:00:01", name="x", rssi=-40, phy_hint="wifi-ap")
+    check(manufacturer_label(local_wifi, {}) == "Locally administered MAC", "local wifi label")
+    stamped = Hit(mac="C2:11:22:33:44:55", name="Tag", rssi=-40, phy_hint="ble", address_type="random", manufacturer="Apple, Inc.")
+    check(manufacturer_label(stamped, {}) == "Apple, Inc.", "company line overrides a random address")
+
+    ready = describe_ubertooth(
+        0,
+        {"vendor": "1d50", "product": "6002", "serial": "abc", "manufacturer": "Great Scott Gadgets", "name": "Ubertooth One"},
+        "/usr/bin/ubertooth-btle",
+    )
+    check(ready["iface"] == "ubertooth-0" and ready["source_type"] == "ubertooth", "ubertooth iface")
+    check(ready["recommended"] and not ready["dfu"], "firmware ubertooth is preferred")
+    dfu = describe_ubertooth(1, {"vendor": "1d50", "product": "6003"}, "/usr/bin/ubertooth-btle")
+    check(dfu["dfu"] and not dfu["recommended"] and dfu["iface"] == "ubertooth-1", "dfu is listed and not preferred")
+    missing = describe_ubertooth(0, {"vendor": "1d50", "product": "6002"}, None)
+    check(not missing["recommended"], "missing ubertooth-btle is not preferred")
+    command = ubertooth_btle_command(0, "ubertooth-btle")
+    check(command == ["ubertooth-btle", "-n", "-U", "0"], "ubertooth command")
+    check(all(flag not in command for flag in ("-f", "-p", "-i", "-I", "-s", "-j", "-J")), "no follow or interference")
+    try:
+        Ubertooth(0, dfu=True).open()
+        check(False, "dfu open should fail")
+    except RadioError as exc:
+        check("unplug" in str(exc).lower(), "dfu open message")
+    try:
+        Ubertooth(0, binary="").open()
+        check(False, "missing tool should fail")
+    except RadioError as exc:
+        check("ubertooth-btle" in str(exc), "missing tool message")
+
+    sample = """\
+systime=100 freq=2402 addr=8e89bed6 delta_t=1.000 ms rssi=-47
+00 11 22 33
+Advertising / AA 8e89bed6 (valid)/ 20 bytes
+    Channel Index: 37
+    Type:  ADV_IND
+    AdvA:  aa:bb:cc:dd:ee:01 (public)
+    AdvData: 02 01 06
+        Type 01 (Flags)
+           00000110
+
+        Type 09 (Complete Local Name)
+           Dock tag
+        Type 0a (Tx Power Level)
+           4 dBm
+        Type ff (Manufacturer Specific Data)
+           Company: Apple, Inc.
+           Data: 01 02
+
+    Data:  aa bb
+    CRC:  01 02 03
+systime=200 freq=2402 addr=8e89bed6 delta_t=2.000 ms rssi=-60
+Advertising / AA 8e89bed6 (valid)/ 12 bytes
+    Channel Index: 37
+    Type:  ADV_IND
+    AdvA:  c2:11:22:33:44:55 (random)
+
+    Data:  c2
+    CRC:  04 05 06
+systime=300 freq=2402 addr=8e89bed6 delta_t=1.000 ms rssi=-55
+Advertising / AA 8e89bed6 (valid)/ 34 bytes
+    Channel Index: 37
+    Type:  CONNECT_REQ
+    InitA: aa:bb:cc:dd:ee:09 (public)
+    AdvA:  c2:11:22:33:44:55 (random)
+
+    Data:  00
+    CRC:  07 08 09
+systime=400 freq=2402 addr=12345678 delta_t=1.000 ms rssi=-40
+Data / AA 12345678 (valid) / 10 bytes
+    Channel Index: 9
+    LLID: 2 / LL Data PDU / L2CAP start
+
+    Data:  01
+    CRC:  0a 0b 0c
+systime=500 freq=2402 addr=8e89bed6 delta_t=1.000 ms rssi=-51
+Advertising / AA 8e89bed6 (valid)/ 14 bytes
+    Channel Index: 37
+    Type:  SCAN_REQ
+    ScanA: 11:22:33:44:55:66 (public)
+    AdvA:  aa:bb:cc:dd:ee:01 (public)
+
+    Data:  11
+    CRC:  0d 0e 0f
+systime=600 freq=2402 addr=8e89bed6 delta_t=1.000 ms rssi=5
+Advertising / AA 8e89bed6 (valid)/ 8 bytes
+    Channel Index: 37
+    Type:  ADV_NONCONN_IND
+    AdvA:  28:6f:b9:00:00:02 (public)
+
+    Data:  28
+    CRC:  10 11 12
+systime=700 freq=2402 addr=8e89bed6 delta_t=1.000 ms rssi=-44
+Advertising / AA 8e89bed6 (valid)/ 10 bytes
+    Channel Index: 37
+    Type:  ADV_IND
+    AdvA:  aa:bb:cc:dd:ee:08 (public)
+        Type 08
+           44 6f 63 6b
+
+    Data:  08
+    CRC:  13 14 15
+"""
+    heard = parse_ubertooth_text(sample)
+    by_mac = {hit.mac: hit for hit in heard}
+    dock = by_mac.get("AA:BB:CC:DD:EE:01")
+    check(dock is not None and dock.rssi == -47, "ubertooth rssi")
+    check(dock is not None and dock.name == "Dock tag", "ubertooth name")
+    check(dock is not None and dock.manufacturer == "Apple, Inc.", "ubertooth company")
+    check(dock is not None and dock.advertised_tx == 4 and dock.channel == 37, "ubertooth tx and channel")
+    check("C2:11:22:33:44:55" in by_mac and by_mac["C2:11:22:33:44:55"].rssi == -60, "random advert")
+    check("AA:BB:CC:DD:EE:09" not in by_mac, "connect request is ignored")
+    check("11:22:33:44:55:66" in by_mac, "scan request uses ScanA")
+    check(by_mac.get("28:6F:B9:00:00:02") is not None and by_mac["28:6F:B9:00:00:02"].rssi is None, "implausible rssi dropped")
+    check(by_mac.get("AA:BB:CC:DD:EE:08") is not None and by_mac["AA:BB:CC:DD:EE:08"].name == "Dock", "shortened name")
+    check(all(hit.phy_hint == "ble" for hit in heard), "ubertooth hits are BLE")
 
     if failures:
         for message in failures:
