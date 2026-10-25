@@ -52,7 +52,7 @@ from pathlib import Path
 
 
 TOOL_NAME = "The Marksman"
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 # Binaries the hunt calls. nmcli is used when NetworkManager is present.
 # ubertooth-btle is optional: a missing name must not fail --setup on dnf.
 REQUIRED_TOOLS = ("iw", "ip", "rfkill", "busctl", "bluetoothctl")
@@ -2388,7 +2388,10 @@ def _hit_from_device(dev: dict, path: str = "") -> Hit:
     except (TypeError, ValueError):
         advertised = None
     addr_type = str(_variant(dev, "AddressType") or "")
-    hint = "ble" if addr_type else "bt-classic"
+    # A phone in pairing mode answers classic inquiry. BlueZ still sets AddressType
+    # to public, and that device has a class of device but no LE advertising flags.
+    classic = _variant(dev, "Class") is not None and _variant(dev, "AdvertisingFlags") is None
+    hint = "bt-classic" if classic or not addr_type else "ble"
     return Hit(
         mac=mac,
         name=name,
@@ -2706,11 +2709,19 @@ _ADV_PDUS = {
 }
 
 
-def ubertooth_btle_command(index: int, binary: str = "ubertooth-btle") -> list[str]:
-    """Passive advertising receive. Channel 37 is the tool's default. No follow, no transmit."""
+UBERTOOTH_ADV_CHANNELS = (37, 38, 39)
+
+
+def ubertooth_btle_command(index: int, binary: str = "ubertooth-btle", channel: int | None = None) -> list[str]:
+    """Passive advertising receive. No follow and no transmit. Channel is 37, 38, or 39."""
     if index < 0 or index > 7:
         raise RadioError(f"Ubertooth index {index} is outside 0-7.")
-    return [binary, "-n", "-U", str(index)]
+    command = [binary, "-n", "-U", str(index)]
+    if channel is not None:
+        if channel not in UBERTOOTH_ADV_CHANNELS:
+            raise RadioError(f"Ubertooth advertising channel {channel} is not 37, 38, or 39.")
+        command.extend(["-A", str(channel)])
+    return command
 
 
 def _text_from_ubertooth_name(text: str) -> str:
@@ -2909,7 +2920,9 @@ class Ubertooth:
         self._fold = _UbertoothFold()
         self._devices: dict[str, Hit] = {}
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._reader: threading.Thread | None = None
+        self._channel = UBERTOOTH_ADV_CHANNELS[0]
 
     def _merge(self, hit: Hit) -> None:
         prev = self._devices.get(hit.mac)
@@ -2942,47 +2955,7 @@ class Ubertooth:
             self.note = ""
             self._merge(hit)
 
-    def _read_loop(self) -> None:
-        proc = self.proc
-        if proc is None or proc.stdout is None:
-            return
-        for line in proc.stdout:
-            self._ingest(line)
-        hit = self._fold.finish()
-        if hit is not None:
-            with self._lock:
-                self.note = ""
-                self._merge(hit)
-
-    def open(self) -> None:
-        if self.dfu:
-            raise RadioError("This Ubertooth is in DFU mode. Unplug it and plug it back in.")
-        binary = self._binary if self._binary is not None else which("ubertooth-btle")
-        if not binary:
-            raise RadioError(
-                "ubertooth-btle is not installed. On Debian and Ubuntu: sudo apt install ubertooth"
-            )
-        command = ubertooth_btle_command(self.index, binary)
-        self.proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
-        self._reader = threading.Thread(target=self._read_loop, name="marksman-ubertooth", daemon=True)
-        self._reader.start()
-        time.sleep(0.4)
-        proc = self.proc
-        if proc is not None and proc.poll() is not None and not self._devices:
-            detail = self.note or (
-                "ubertooth-btle exited. Check that the stick is plugged in and that this user can open it."
-            )
-            self.close()
-            raise RadioError(detail)
-
-    def close(self) -> None:
+    def _kill_proc(self) -> None:
         proc = self.proc
         self.proc = None
         if proc is None:
@@ -3004,6 +2977,77 @@ class Ubertooth:
                 except subprocess.TimeoutExpired:
                     pass
 
+    def _read_loop(self) -> None:
+        # One stick can sit on one advertising channel. Rotate 37, 38, and 39.
+        binary = self._binary or "ubertooth-btle"
+        hop = 0
+        while not self._stop.is_set():
+            channel = UBERTOOTH_ADV_CHANNELS[hop % len(UBERTOOTH_ADV_CHANNELS)]
+            hop += 1
+            self._channel = channel
+            command = ubertooth_btle_command(self.index, binary, channel)
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+            self.proc = proc
+            deadline = time.monotonic() + 2.5
+            stream = proc.stdout
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                if stream is None:
+                    break
+                ready, _, _ = select.select([stream], [], [], 0.3)
+                if not ready:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                line = stream.readline()
+                if not line:
+                    break
+                self._ingest(line)
+            hit = self._fold.finish()
+            if hit is not None:
+                with self._lock:
+                    self.note = ""
+                    self._merge(hit)
+            died_early = proc.poll() is not None and time.monotonic() < deadline
+            self._kill_proc()
+            if died_early and not self._devices and hop == 1:
+                break
+
+    def open(self) -> None:
+        if self.dfu:
+            raise RadioError("This Ubertooth is in DFU mode. Unplug it and plug it back in.")
+        binary = self._binary if self._binary is not None else which("ubertooth-btle")
+        if not binary:
+            raise RadioError(
+                "ubertooth-btle is not installed. On Debian and Ubuntu: sudo apt install ubertooth"
+            )
+        self._binary = binary
+        self._stop.clear()
+        self._reader = threading.Thread(target=self._read_loop, name="marksman-ubertooth", daemon=True)
+        self._reader.start()
+        time.sleep(0.5)
+        proc = self.proc
+        if self._stop.is_set() or (proc is not None and proc.poll() is not None and not self._devices and not self._reader.is_alive()):
+            detail = self.note or (
+                "ubertooth-btle exited. Check that the stick is plugged in and that this user can open it."
+            )
+            self.close()
+            raise RadioError(detail)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._kill_proc()
+        reader = self._reader
+        if reader is not None and reader.is_alive() and threading.current_thread() is not reader:
+            reader.join(timeout=2.0)
+            self._reader = None
+
     def devices(self) -> list[Hit]:
         with self._lock:
             return list(self._devices.values())
@@ -3015,6 +3059,63 @@ class Ubertooth:
             if hit is None or hit.rssi is None:
                 return None
             return float(hit.rssi)
+
+
+class HybridBt:
+    """Ubertooth BLE advertisements plus classic inquiry on a built-in adapter.
+
+    A phone in pairing mode answers inquiry. It does not have to send a BLE
+    advertisement, so the Ubertooth alone does not hear that address.
+    """
+
+    def __init__(self, tooth: Ubertooth, bluez: Bluez) -> None:
+        self.tooth = tooth
+        self.bluez = bluez
+        self.note = ""
+
+    def open(self) -> None:
+        self.tooth.open()
+        try:
+            self.bluez.open()
+        except RadioError as exc:
+            self.note = str(exc)
+
+    def close(self) -> None:
+        try:
+            self.tooth.close()
+        finally:
+            self.bluez.close()
+
+    def devices(self) -> list[Hit]:
+        merged: dict[str, Hit] = {}
+        try:
+            host = self.bluez.devices()
+        except Exception:
+            host = []
+        for hit in host:
+            if hit.mac:
+                merged[hit.mac] = hit
+        for hit in self.tooth.devices():
+            if hit.mac:
+                merged[hit.mac] = hit
+        if self.tooth.note:
+            self.note = self.tooth.note
+        elif not self.note:
+            self.note = self.bluez.note
+        return list(merged.values())
+
+    def rssi(self, mac: str) -> float | None:
+        heard = self.tooth.rssi(mac)
+        if heard is not None:
+            self.note = self.tooth.note
+            return heard
+        heard = self.bluez.rssi(mac)
+        if heard is not None:
+            self.note = (
+                "Classic inquiry on the built-in adapter. "
+                "The Ubertooth did not hear a BLE advertisement from this address."
+            )
+        return heard
 
 
 def bt_match(hit: Hit, target: Target) -> bool:
@@ -3334,8 +3435,8 @@ def collect_bt(radio, window: float) -> list[Hit]:
         return hits
     if not hasattr(radio, "retune"):
         radio.note = radio.note or (
-            "No advertisements yet. The Ubertooth listens on channel 37 only, "
-            "and only while a device is advertising."
+            "No advertisements yet. The Ubertooth hops advertising channels 37, 38, and 39. "
+            "A phone in pairing mode is classic inquiry and is listed from the built-in adapter."
         )
         return hits
     log("No Bluetooth advertisements yet. Trying a low-energy scan…", "warn")
@@ -3797,7 +3898,9 @@ def bluetooth_flow(
 ) -> dict[str, HuntStats]:
     track = TrackLog(outdir / "marksman_track.csv")
     if ctrl.get("source_type") == "ubertooth":
-        radio = Ubertooth(int(ctrl.get("ubertooth_index") or 0), dfu=bool(ctrl.get("dfu")))
+        tooth = Ubertooth(int(ctrl.get("ubertooth_index") or 0), dfu=bool(ctrl.get("dfu")))
+        host = next((item for item in list_bt_controllers() if item.get("source_type") == "bluez"), None)
+        radio = HybridBt(tooth, Bluez(host["iface"], host.get("mac") or "")) if host else tooth
     else:
         radio = Bluez(ctrl["iface"], ctrl.get("mac") or "")
     window = min(60.0, max(1.0, float(args.scan_window)))
@@ -4281,7 +4384,52 @@ BSS aa:bb:cc:dd:ee:07(on wlp0)
     check(not missing["recommended"], "missing ubertooth-btle is not preferred")
     command = ubertooth_btle_command(0, "ubertooth-btle")
     check(command == ["ubertooth-btle", "-n", "-U", "0"], "ubertooth command")
-    check(all(flag not in command for flag in ("-f", "-p", "-i", "-I", "-s", "-j", "-J")), "no follow or interference")
+    hopped = ubertooth_btle_command(0, "ubertooth-btle", 38)
+    check(hopped == ["ubertooth-btle", "-n", "-U", "0", "-A", "38"], "ubertooth hops advertising channels")
+    check(all(flag not in hopped for flag in ("-f", "-p", "-i", "-I", "-s", "-j", "-J")), "no follow or interference")
+    try:
+        ubertooth_btle_command(0, "ubertooth-btle", 40)
+        check(False, "bad advertising channel should fail")
+    except RadioError:
+        check(True, "bad advertising channel rejected")
+    classic = _hit_from_device(
+        {
+            "Address": {"data": "D4:5B:51:BB:DC:4F"},
+            "Name": {"data": "moto g power - 2025"},
+            "AddressType": {"data": "public"},
+            "Class": {"data": 5898764},
+            "RSSI": {"data": -46},
+        }
+    )
+    check(classic.phy_hint == "bt-classic" and classic.mac == "D4:5B:51:BB:DC:4F", "pairing-mode phone is classic")
+    le_phone = _hit_from_device(
+        {
+            "Address": {"data": "D4:5B:51:BB:DC:4F"},
+            "Name": {"data": "moto g power - 2025"},
+            "AddressType": {"data": "public"},
+            "Class": {"data": 5898764},
+            "AdvertisingFlags": {"data": [2]},
+            "RSSI": {"data": -46},
+        }
+    )
+    check(le_phone.phy_hint == "ble", "an advertising phone stays BLE")
+
+    class _Quiet:
+        def __init__(self, level: float | None) -> None:
+            self.note = ""
+            self.level = level
+
+        def rssi(self, mac: str) -> float | None:
+            return self.level
+
+    quiet = _Quiet(None)
+    classic_radio = _Quiet(-47.0)
+    hybrid = HybridBt(quiet, classic_radio)  # type: ignore[arg-type]
+    check(hybrid.rssi("D4:5B:51:BB:DC:4F") == -47.0, "classic inquiry rssi is used")
+    check("Classic inquiry" in hybrid.note, "classic inquiry is labeled")
+    quiet.level = -40.0
+    check(hybrid.rssi("D4:5B:51:BB:DC:4F") == -40.0, "ubertooth rssi wins when it heard the address")
+    check(hybrid.note == "", "ubertooth hit does not claim classic inquiry")
     try:
         Ubertooth(0, dfu=True).open()
         check(False, "dfu open should fail")

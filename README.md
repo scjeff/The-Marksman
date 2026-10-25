@@ -200,7 +200,7 @@ Wi-Fi with a known frequency stays on that frequency in monitor mode. The tune u
 
 Bluetooth on a built-in adapter keeps a `bluetoothctl` session open for the whole hunt, so the adapter keeps scanning after the command that started it. Duplicate advertisements stay on, and the level can change while you walk. If the first listen hears nothing, a second listen asks for low-energy advertisements only. Discovery is stopped on exit.
 
-An Ubertooth One does not use BlueZ. The hunt runs `ubertooth-btle -n -U N`, which only receives advertising packets on channel 37 (2402 MHz). It does not follow a connection, transmit, pair, or read GATT. Names and company names come from those advertisements. The process is stopped on exit. Install the tool with the `ubertooth` package (`apt install ubertooth` on Debian and Ubuntu). `--setup` does not install it. A stick in DFU mode (`1d50:6003`) is listed, and a hunt on it asks you to unplug it and plug it back in.
+An Ubertooth One receives BLE advertisements with `ubertooth-btle -n -U N`. The listen hops advertising channels 37, 38, and 39. It does not follow a connection, transmit, pair, or read GATT. A phone in pairing mode answers a classic inquiry and often sends no BLE advertisement, so that address is heard by the built-in adapter and shown in the same list. The sight says so when the signal comes from that inquiry. The Ubertooth process is stopped on exit. Install the tool with the `ubertooth` package (`apt install ubertooth` on Debian and Ubuntu). `--setup` does not install it. A stick in DFU mode (`1d50:6003`) is listed, and a hunt on it asks you to unplug it and plug it back in.
 
 ## Distance estimate
 
