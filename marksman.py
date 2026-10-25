@@ -52,7 +52,7 @@ from pathlib import Path
 
 
 TOOL_NAME = "The Marksman"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 # Binaries the hunt calls. nmcli is used when NetworkManager is present.
 # ubertooth-btle is optional: a missing name must not fail --setup on dnf.
 REQUIRED_TOOLS = ("iw", "ip", "rfkill", "busctl", "bluetoothctl")
@@ -1676,7 +1676,8 @@ def list_wifi_controllers() -> list[dict]:
             continue
         driver = net_driver(iface)
         hint, recommended = classify_wifi(iface, driver)
-        if row.get("type") == "monitor":
+        iw_type = row.get("type") or ""
+        if iw_type == "monitor":
             hint = f"{hint} (left in monitor mode)"
         info = phy_info(row.get("phy") or "")
         kill = rfkill_for([row.get("phy") or "", iface])
@@ -1699,6 +1700,9 @@ def list_wifi_controllers() -> list[dict]:
                 "monitor": bool(info.get("monitor")),
                 "bands": info.get("bands") or [],
                 "recommended": recommended and bool(info.get("monitor")),
+                "iw_type": iw_type,
+                "borrowed_monitor": False,
+                "source_type": "kernel",
                 "label": f"{iface}  {hint}",
                 "detail": [
                     f"phy={row.get('phy') or '-'}  mac={row.get('mac') or '-'}  driver={driver or '-'}  bus={bus}",
@@ -1707,7 +1711,106 @@ def list_wifi_controllers() -> list[dict]:
                 ],
             }
         )
-    items.sort(key=lambda item: (not item.get("recommended"), item["iface"]))
+    return annotate_kismet_wifi(items)
+
+
+def parse_kismet_cap_list(text: str) -> list[tuple[str, str]]:
+    """Parse `kismet_cap_* --list`. Kismet 2026 puts a parenthetical inside the driver field."""
+    found: list[tuple[str, str]] = []
+    for line in (text or "").splitlines():
+        match = re.match(r"\s+(\S+)\s+\((.*)\)\s*$", line)
+        if match:
+            found.append((match.group(1), match.group(2).strip()))
+    return found
+
+
+def kismet_cap_sources(tool: str) -> list[tuple[str, str]]:
+    """Read a Kismet 2026 capture helper. `--list` is printed on stderr and exits 2 when not root."""
+    binary = which(tool)
+    if not binary:
+        return []
+    proc = run_cmd([binary, "--list"], timeout=8)
+    return parse_kismet_cap_list(f"{proc.stdout or ''}\n{proc.stderr or ''}")
+
+
+def kismet_monitor_parent(iface: str, names: set[str]) -> str:
+    """Kismet names the sibling monitor vif `<iface>mon` and leaves the station associated."""
+    if iface.endswith("mon") and len(iface) > 3:
+        parent = iface[:-3]
+        if parent in names:
+            return parent
+    return ""
+
+
+def _wifi_rank(item: dict) -> tuple:
+    if item.get("recommended") and not item.get("borrowed_monitor"):
+        group = 0
+    elif item.get("borrowed_monitor"):
+        group = 1
+    elif item.get("recommended"):
+        group = 2
+    else:
+        group = 3
+    return (group, item["iface"])
+
+
+def apply_kismet_monitor_flags(items: list[dict]) -> list[dict]:
+    """Prefer an existing Kismet monitor vif, and do not mark the station interface preferred."""
+    names = {item["iface"] for item in items}
+    parents: set[str] = set()
+    for item in items:
+        parent = kismet_monitor_parent(item["iface"], names)
+        if not parent or item.get("iw_type") != "monitor":
+            continue
+        item["borrowed_monitor"] = True
+        item["recommended"] = True
+        parents.add(parent)
+        base = (item.get("label") or item["iface"]).replace(" (left in monitor mode)", "")
+        item["label"] = f"{base} (Kismet monitor vif)"
+        item.setdefault("detail", []).append(
+            f"Already in monitor mode beside {parent}. "
+            f"The hunt uses this vif and leaves {parent} associated. "
+            "Exit does not set the vif back to managed."
+        )
+    for item in items:
+        if item["iface"] not in parents:
+            continue
+        item["recommended"] = False
+        item.setdefault("detail", []).append(
+            f"{item['iface']}mon is already in monitor mode. Pick that vif so this interface stays associated."
+        )
+    items.sort(key=_wifi_rank)
+    return items
+
+
+def annotate_kismet_wifi(items: list[dict]) -> list[dict]:
+    apply_kismet_monitor_flags(items)
+    seen = {item["iface"] for item in items}
+    for iface, driver in kismet_cap_sources("kismet_cap_usbwifi"):
+        if iface in seen:
+            continue
+        seen.add(iface)
+        items.append(
+            {
+                "iface": iface,
+                "phy": "",
+                "mac": "",
+                "driver": driver,
+                "monitor": False,
+                "bands": [],
+                "recommended": False,
+                "borrowed_monitor": False,
+                "iw_type": "",
+                "source_type": "kismet-usb",
+                "label": f"{iface}  Kismet userspace USB Wi-Fi",
+                "detail": [
+                    f"driver={driver}",
+                    "kismet_cap_usbwifi sees this adapter, and the kernel has no network interface for it. "
+                    "This hunt cannot open it until the kernel driver binds.",
+                ],
+            }
+        )
+    items.sort(key=_wifi_rank)
     return items
 
 
@@ -1922,6 +2025,13 @@ class WifiPort:
         ip = which("ip")
         if not iw or not ip:
             raise RadioError("iw and ip are required for monitor mode.")
+        if iface_arphrd(self.iface) == ARPHRD_IEEE80211_RADIOTAP:
+            # Kismet 2026 leaves a sibling *mon vif up. Borrow it; close() must not set it managed.
+            self.touched = False
+            self._bind_monitor(iw)
+            if lock_freq(channel, freq):
+                self.tune(channel, freq)
+            return
         nm_set_managed(self.iface, False)
         self.touched = True
         run_cmd([iw, "dev", self.iface, "set", "power_save", "off"], timeout=4)
@@ -1938,6 +2048,11 @@ class WifiPort:
         if iface_arphrd(self.iface) != ARPHRD_IEEE80211_RADIOTAP:
             self.close()
             raise RadioError("The driver did not expose radiotap frames.")
+        self._bind_monitor(iw)
+        if lock_freq(channel, freq):
+            self.tune(channel, freq)
+
+    def _bind_monitor(self, iw: str) -> None:
         try:
             sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
             sock.bind((self.iface, 0))
@@ -1950,8 +2065,6 @@ class WifiPort:
         # otherbss asks the driver for frames from networks we are not joined to.
         # Built-in Intel cards often hide client data without it.
         run_cmd([iw, "dev", self.iface, "set", "monitor", "otherbss"], timeout=4)
-        if lock_freq(channel, freq):
-            self.tune(channel, freq)
 
     def tune(self, channel: int | None = None, freq: float | None = None) -> bool:
         freq_f = lock_freq(channel, freq)
@@ -3782,6 +3895,11 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 print("  Enter 1 or 2.")
         ctrl = pick_controller(kind, args.iface)
+        if kind == "wifi" and ctrl.get("source_type") == "kismet-usb" and not args.dry_run:
+            raise RadioError(
+                f"{ctrl['iface']} is a Kismet userspace USB source and has no kernel network interface. "
+                "The hunt cannot open it until that adapter is bound to its kernel driver."
+            )
         preset = preset_target(args, kind)
     except RadioError as exc:
         log(str(exc), "err")
@@ -4261,6 +4379,53 @@ Advertising / AA 8e89bed6 (valid)/ 10 bytes
     check(by_mac.get("28:6F:B9:00:00:02") is not None and by_mac["28:6F:B9:00:00:02"].rssi is None, "implausible rssi dropped")
     check(by_mac.get("AA:BB:CC:DD:EE:08") is not None and by_mac["AA:BB:CC:DD:EE:08"].name == "Dock", "shortened name")
     check(all(hit.phy_hint == "ble" for hit in heard), "ubertooth hits are BLE")
+
+    listed = parse_kismet_cap_list(
+        "linuxwifi supported data sources:\n"
+        "    wlp0s20f3 (iwlwifi)\n"
+        "    wlp0s20f3mon (iwlwifi)\n"
+        "usbwifi supported data sources:\n"
+        "    mt7921-0 (mt7921u (0e8d:7961))\n"
+    )
+    check(listed[0] == ("wlp0s20f3", "iwlwifi"), "kismet wifi source")
+    check(listed[2] == ("mt7921-0", "mt7921u (0e8d:7961)"), "kismet usbwifi nested driver")
+    stderr_only = parse_kismet_cap_list("\n    mt7921-0 (mt7921u (0e8d:7961))\n")
+    check(stderr_only == [("mt7921-0", "mt7921u (0e8d:7961)")], "kismet list on stderr still parses")
+    check(kismet_monitor_parent("wlp0s20f3mon", {"wlp0s20f3", "wlp0s20f3mon"}) == "wlp0s20f3", "kismet vif parent")
+    check(kismet_monitor_parent("mon0", {"wlan0", "mon0"}) == "", "unrelated mon name")
+    sample_wifi = [
+        {
+            "iface": "wlxabc",
+            "iw_type": "managed",
+            "recommended": True,
+            "label": "wlxabc  USB Wi-Fi (preferred hunter)",
+            "detail": [],
+            "borrowed_monitor": False,
+        },
+        {
+            "iface": "wlp0s20f3",
+            "iw_type": "managed",
+            "recommended": False,
+            "label": "wlp0s20f3  Built-in Intel Wi-Fi",
+            "detail": [],
+            "borrowed_monitor": False,
+        },
+        {
+            "iface": "wlp0s20f3mon",
+            "iw_type": "monitor",
+            "recommended": False,
+            "label": "wlp0s20f3mon  Built-in Intel Wi-Fi (left in monitor mode)",
+            "detail": [],
+            "borrowed_monitor": False,
+        },
+    ]
+    apply_kismet_monitor_flags(sample_wifi)
+    check(sample_wifi[0]["iface"] == "wlxabc", "usb hunter stays ahead of the kismet vif")
+    vif = next(item for item in sample_wifi if item["iface"] == "wlp0s20f3mon")
+    station = next(item for item in sample_wifi if item["iface"] == "wlp0s20f3")
+    check(vif["borrowed_monitor"] and vif["recommended"], "kismet vif is borrowed")
+    check("Kismet monitor vif" in vif["label"] and "left in monitor mode" not in vif["label"], "vif label")
+    check(station["recommended"] is False, "station interface is not preferred beside its vif")
 
     if failures:
         for message in failures:

@@ -47,10 +47,12 @@ Any Linux host with `iw`, `ip`, `rfkill`, and BlueZ (`bluetoothctl`, plus `busct
 
 | Role | What works | Notes |
 | --- | --- | --- |
-| Wi-Fi | USB adapter with **monitor mode** | Preferred. MediaTek mt76 / Panda-class (`mt7921u` and similar) are marked preferred. A built-in radio is listed too. |
+| Wi-Fi | USB adapter with **monitor mode** | Preferred. MediaTek mt76 / Panda-class (`mt7921u` and similar) are marked preferred when the kernel creates a network interface. A built-in radio is listed too. Kismet 2026 may leave a sibling `<iface>mon` interface in monitor mode; the hunt uses that vif and leaves the station interface associated. |
 | Bluetooth | BlueZ `hci` controller, or an Ubertooth One | The built-in adapter works, including a Dell Intel card. An Ubertooth One (`1d50:6002`) is listed as `ubertooth-0` and is preferred when `ubertooth-btle` is installed and the stick is not in DFU mode. The hunt listens for advertisements on channel 37. It does not follow connections. |
 
 The script lists whatever is plugged in and lets you pick. A soft block on the chosen radio is lifted for the hunt and put back on exit. A hardware kill switch cannot be overridden.
+
+Kismet 2026.10 is not required. When it is installed, `kismet_cap_linux_wifi --list` and `kismet_cap_usbwifi --list` are read so the controller list matches the capture helpers. A `kismet_cap_usbwifi` source with no kernel interface is shown and cannot be hunted until the kernel driver binds. An existing `<iface>mon` vif is borrowed: exit does not set it back to managed.
 
 `sudo` is required for the Wi-Fi scan and for monitor mode.
 
@@ -279,6 +281,8 @@ Do not commit capture output. The session directory is in `.gitignore`.
 | `iw`, `bluetoothctl`, or `busctl` missing | `sudo python3 marksman.py --setup` |
 | `iw scan` says operation not permitted | `sudo python3 marksman.py` |
 | No Wi-Fi controllers | USB adapter seated; `python3 marksman.py --check`. An adapter left in monitor mode is still listed |
+| Kismet monitor vif is listed | That `<iface>mon` interface is already in monitor mode. Pick it. The station interface stays associated, and exit does not convert the vif back to managed |
+| MediaTek adapter only appears as `mt7921-0` | `kismet_cap_usbwifi` sees it, and the kernel has no network interface. The hunt cannot open a userspace Kismet source. Bind `mt7921u` so `iw` shows the adapter |
 | Soft-blocked | The hunt unblocks the chosen radio and blocks it again on exit |
 | Hard-blocked | Flip the airplane / wireless switch |
 | Monitor mode failed, slow scan instead | The driver did not expose radiotap. The sight still works for access points, a few seconds per update. Client devices need monitor mode |
