@@ -26,7 +26,7 @@ What the radios do:
 - The Wi-Fi **sight** is monitor mode, receive only. It does not inject frames, deauthenticate clients, or associate.
 - The Wi-Fi **list** uses a normal `iw scan` (that scan sends probe requests), then a short monitor-mode listen for phones, appliances, and ad-hoc radios. The listen is receive only.
 - Bluetooth on the built-in adapter uses BlueZ discovery (standard inquiry and LE scan, including scan requests). It does **not** pair, connect, or read GATT.
-- An Ubertooth One, when it is plugged in, is a receive-only BTLE advertising sniffer on channel 37 (`ubertooth-btle -n`). It does not follow connections, transmit, pair, or read GATT.
+- An Ubertooth One, when it is plugged in, is a receive-only BTLE advertising sniffer (`ubertooth-btle -n`). The listen hops advertising channels 37, 38, and 39. It does not follow connections, transmit, pair, or read GATT. A phone in pairing mode answers a classic inquiry and often sends no BLE advertisement, so that address is heard by the built-in adapter and shown in the same list.
 
 Collection starts only after you type `YES` (interactive) or pass `--i-have-roe`. That acknowledgement is stored with the session.
 
@@ -48,7 +48,7 @@ Any Linux host with `iw`, `ip`, `rfkill`, and BlueZ (`bluetoothctl`, plus `busct
 | Role | What works | Notes |
 | --- | --- | --- |
 | Wi-Fi | USB adapter with **monitor mode** | Preferred. MediaTek mt76 / Panda-class (`mt7921u` and similar) are marked preferred when the kernel creates a network interface. A built-in radio is listed too. Kismet 2026 may leave a sibling `<iface>mon` interface in monitor mode; the hunt uses that vif and leaves the station interface associated. |
-| Bluetooth | BlueZ `hci` controller, or an Ubertooth One | The built-in adapter works, including a Dell Intel card. An Ubertooth One (`1d50:6002`) is listed as `ubertooth-0` and is preferred when `ubertooth-btle` is installed and the stick is not in DFU mode. The hunt listens for advertisements on channel 37. It does not follow connections. |
+| Bluetooth | BlueZ `hci` controller, or an Ubertooth One | The built-in adapter works, including a Dell Intel card. An Ubertooth One (`1d50:6002`) is listed as `ubertooth-0` and is preferred when `ubertooth-btle` is installed and the stick is not in DFU mode. The hunt hops BLE advertising channels 37, 38, and 39 and does not follow connections. A phone in pairing mode is listed from the built-in adapter's inquiry when the Ubertooth hears no BLE advertisement for that address. |
 
 The script lists whatever is plugged in and lets you pick. A soft block on the chosen radio is lifted for the hunt and put back on exit. A hardware kill switch cannot be overridden.
 
@@ -289,7 +289,7 @@ Do not commit capture output. The session directory is in `.gitignore`.
 | Router is listed, a Roku or oven is not | Those are clients. They show up as `device` only when they transmit during the listen. Choosing the home SSID follows the router. Enter the device MAC with `7` if you know it. A built-in Intel card that only passes beacons will not see them; use a USB adapter |
 | Ubertooth is not listed | `lsusb` should show `1d50:6002`. Install the `ubertooth` package so `ubertooth-btle` is on PATH. A stick in DFU mode is `1d50:6003`; unplug it and plug it back in. `--setup` does not install that package |
 | Bluetooth list stays empty on the built-in adapter | The radio must be unblocked and `bluetoothd` running. Devices have to be awake and advertising. Press `0` to listen again. A device with no name has an em dash in the name column |
-| Bluetooth list stays empty on the Ubertooth | The stick only hears advertising channel 37. Devices have to be advertising. It does not follow a connection. Press `0` to listen again |
+| Bluetooth list stays empty on the Ubertooth | The stick hears legacy BLE advertisements while it hops channels 37, 38, and 39. It does not follow a connection. A phone in pairing mode often sends no BLE advertisement; that address is added from the built-in adapter. Press `0` to listen again |
 | Sight says LOST | The mark went quiet or you left its channel. `0` rescans. `b` returns to the list |
 | Column sits in one place | It recenters when the last minute of signal barely moved. Walk farther. The dBm number is the absolute level |
 | Distance looks absurd | The assumed TX power is probably wrong. Trust CLOSING / FALLING BACK over the meter number |
